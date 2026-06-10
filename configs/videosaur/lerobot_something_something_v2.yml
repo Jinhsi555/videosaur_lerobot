@@ -1,0 +1,136 @@
+experiment_group: videosaur
+experiment_name: lerobot_something_something_v2
+
+globals:
+  NUM_SLOTS: 11
+  SLOT_DIM: 128
+  VIT_MODEL: vit_base_patch8_224_dino
+  FEAT_DIM: "${config_prop: VIT_PARAMS, ${.VIT_MODEL}, FEAT_DIM}"
+  NUM_PATCHES: "${config_prop: VIT_PARAMS, ${.VIT_MODEL}, NUM_PATCHES}"
+  NUM_GPUS: 1
+  BATCH_SIZE_PER_GPU: 32
+  TOTAL_BATCH_SIZE: "${mul: ${.NUM_GPUS}, ${.BATCH_SIZE_PER_GPU}}"
+  BASE_LR: 0.0001
+  SIM_TEMP: 0.075
+  SIM_WEIGHT: 0.1
+
+trainer:
+  max_steps: 100000
+  log_every_n_steps: 500
+  val_check_interval: 1000
+  gradient_clip_val: 0.05
+  devices: 1
+
+optimizer:
+  name: Adam
+  # Scale learning rate by batch size: take base lr once for every 32 samples
+  lr: "${eval: 'a / 32 * b', ${globals.TOTAL_BATCH_SIZE}, ${globals.BASE_LR}}"
+  lr_scheduler:
+    name: exp_decay_with_warmup
+    warmup_steps: 2500
+    decay_steps: ${trainer.max_steps}
+
+model:
+  input_type: video
+  visualize: false
+  visualize_every_n_steps: 10000
+  losses:
+    loss_timesim:
+      name: CrossEntropyLoss
+      target_key: encoder.vit_block_keys12
+      remove_last_n_frames: 1
+      pred_dims:
+        - 0
+        - ${globals.NUM_PATCHES}
+      target_transform:
+        name: utils.FeatureTimeSimilarity
+        softmax: true
+        temperature: ${globals.SIM_TEMP}
+        threshold: 0.0
+  loss_weights:
+    loss_timesim: ${globals.SIM_WEIGHT}
+
+  initializer:
+    name: RandomInit
+    n_slots: ${globals.NUM_SLOTS}
+    dim: ${globals.SLOT_DIM}
+
+  encoder:
+    backbone:
+      name: TimmExtractor
+      model: ${globals.VIT_MODEL}
+      features:
+      - vit_block12
+      - vit_block_keys12
+      frozen: true
+      pretrained: true
+    output_transform:
+      name: networks.two_layer_mlp
+      inp_dim: ${globals.FEAT_DIM}
+      outp_dim: ${globals.SLOT_DIM}
+      hidden_dim: "${mul: ${globals.FEAT_DIM}, 2}"
+      layer_norm: true
+
+  grouper:
+    name: SlotAttention
+    inp_dim: ${globals.SLOT_DIM}
+    slot_dim: ${globals.SLOT_DIM}
+    n_iters: 2
+    use_mlp: false
+
+  latent_processor:
+    first_step_corrector_args:
+      n_iters: 3
+
+  decoder:
+    name: SlotMixerDecoder
+    inp_dim: ${globals.SLOT_DIM}
+    embed_dim: ${globals.SLOT_DIM}
+    outp_dim:  ${globals.NUM_PATCHES}
+    n_patches: ${globals.NUM_PATCHES}
+    allocator:
+      name: TransformerEncoder
+      dim: ${globals.SLOT_DIM}
+      memory_dim: ${globals.SLOT_DIM}
+      n_blocks: 2
+      n_heads: 4
+    renderer:
+      name: MLP
+      inp_dim: ${globals.SLOT_DIM}
+      outp_dim: 1024
+      hidden_dims: [1024, 1024, 1024]
+      final_activation: true
+    renderer_dim: 1024
+    use_layer_norms: true
+    pos_embed_mode: add
+
+  predictor:
+    name: networks.TransformerEncoder
+    dim: ${globals.SLOT_DIM}
+    n_blocks: 1
+    n_heads: 4
+
+val_metrics: null
+
+dataset:
+  name: LeRobotDataModule
+  repo_id: something_something_v2
+  root: /mnt/oss_data/lerobotv3_processed/something_something_v2
+  camera_key: null
+
+  batch_size: ${globals.BATCH_SIZE_PER_GPU}
+  val_batch_size: 32
+  num_workers: 0
+  num_val_workers: 0
+
+  image_size: 224
+  video_backend: pyav
+  tolerance_s: 1e-3
+
+  frame_sampling:
+    mode: random_frames
+    window_before: 15
+    num_frames: 4
+    include_current: true
+
+  val_fraction: 0.0

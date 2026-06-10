@@ -45,6 +45,11 @@ def build(config, name: Optional[str] = "WebdatasetDataModule", data_dir: Option
                 ),
             ),
         )
+    elif name == "LeRobotDataModule":
+        return LeRobotDataModule(
+            data_dir=data_dir,
+            **config_as_kwargs(config),
+        )
     else:
         raise ValueError(f"Unknown dataset module `{name}`")
 
@@ -514,6 +519,376 @@ def _to_abs_shard_path(
     else:
         assert isinstance(shards, Iterable), f"Expected iterable but found {type(shards)}"
         return [_to_abs_shard_path(shard, data_root_dir) for shard in shards]
+
+
+def _to_optional_list(value):
+    if value is None:
+        return None
+    return list(value)
+
+
+def _to_size_tuple(value: Union[int, Tuple[int, int], List[int]]) -> Tuple[int, int]:
+    if isinstance(value, int):
+        return (value, value)
+    if isinstance(value, (list, tuple, ListConfig)) and len(value) == 2:
+        return (int(value[0]), int(value[1]))
+    raise ValueError(f"Expected int or pair for image size, but got {value}")
+
+
+class LeRobotImageTransform:
+    """Resize and normalize LeRobot camera frames for VideoSAUR video inputs."""
+
+    def __init__(
+        self,
+        size: Union[int, Tuple[int, int], List[int]] = 224,
+        mean: Tuple[float, float, float] = tuple(transforms.IMAGENET_DEFAULT_MEAN),
+        std: Tuple[float, float, float] = tuple(transforms.IMAGENET_DEFAULT_STD),
+    ):
+        self.size = _to_size_tuple(size)
+        self.mean = torch.tensor(mean).view(1, 3, 1, 1)
+        self.std = torch.tensor(std).view(1, 3, 1, 1)
+
+    def __call__(self, images):
+        images = torch.as_tensor(images)
+        single_image = images.ndim == 3
+
+        if images.ndim not in (3, 4):
+            raise ValueError(
+                "Expected LeRobot image tensor with shape [C,H,W] or [T,C,H,W], "
+                f"but got shape {tuple(images.shape)}"
+            )
+
+        if images.ndim == 3 and images.shape[0] not in (1, 3) and images.shape[-1] in (1, 3):
+            images = images.permute(2, 0, 1)
+        elif images.ndim == 4 and images.shape[1] not in (1, 3) and images.shape[-1] in (1, 3):
+            images = images.permute(0, 3, 1, 2)
+
+        if single_image:
+            images = images.unsqueeze(0)
+
+        needs_rescale = not torch.is_floating_point(images)
+        images = images.float()
+        if needs_rescale or images.max() > 2.0:
+            images = images / 255.0
+
+        if images.shape[-2:] != self.size:
+            images = torch.nn.functional.interpolate(
+                images, size=self.size, mode="bilinear", align_corners=False
+            )
+
+        mean = self.mean.to(device=images.device, dtype=images.dtype)
+        std = self.std.to(device=images.device, dtype=images.dtype)
+        images = (images - mean) / std
+
+        return images.squeeze(0) if single_image else images
+
+
+class LeRobotVideoDataset(torch.utils.data.Dataset):
+    """Adapts a LeRobotDataset sample to VideoSAUR's `video` input key."""
+
+    def __init__(
+        self,
+        dataset,
+        camera_key: str,
+        frame_sampling: Dict[str, Any],
+        random_sampling: bool,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.camera_key = camera_key
+        self.mode = frame_sampling.get("mode", "random_frames")
+        self.num_frames = int(frame_sampling.get("num_frames", 4))
+        self.random_sampling = random_sampling
+
+        if self.mode not in ("random_frames", "contiguous_clip"):
+            raise ValueError(
+                f"Unsupported LeRobot frame sampling mode `{self.mode}`. "
+                "Supported modes are `random_frames` and `contiguous_clip`."
+            )
+        if self.num_frames <= 0:
+            raise ValueError("`frame_sampling.num_frames` must be positive.")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def _sample_indices(self, num_candidates: int) -> torch.Tensor:
+        if num_candidates < self.num_frames:
+            raise ValueError(
+                f"Need at least {self.num_frames} candidate frames, but got {num_candidates}."
+            )
+
+        if self.mode == "contiguous_clip":
+            max_start = num_candidates - self.num_frames
+            if self.random_sampling and max_start > 0:
+                start = torch.randint(max_start + 1, (1,)).item()
+            else:
+                start = max_start // 2
+            return torch.arange(start, start + self.num_frames)
+
+        if self.random_sampling:
+            indices = torch.randperm(num_candidates)[: self.num_frames]
+            return indices.sort().values
+
+        if self.num_frames == 1:
+            return torch.tensor([num_candidates - 1], dtype=torch.long)
+        return torch.linspace(0, num_candidates - 1, self.num_frames).round().long()
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        video = item[self.camera_key]
+        if video.ndim == 3:
+            video = video.unsqueeze(0)
+
+        indices = self._sample_indices(video.shape[0])
+        return {"video": video[indices]}
+
+
+class LeRobotDataModule(pl.LightningDataModule):
+    """LightningDataModule for LeRobot datasets used as VideoSAUR video inputs."""
+
+    def __init__(
+        self,
+        repo_id: str,
+        root: Optional[str] = None,
+        data_dir: Optional[str] = None,
+        camera_key: Optional[str] = None,
+        frame_sampling: Optional[Dict[str, Any]] = None,
+        batch_size: int = 32,
+        val_batch_size: Optional[int] = None,
+        num_workers: int = 0,
+        num_val_workers: Optional[int] = None,
+        image_size: Union[int, Tuple[int, int], List[int]] = 224,
+        video_backend: Optional[str] = "pyav",
+        tolerance_s: float = 1e-3,
+        val_fraction: float = 0.0,
+        train_episodes: Optional[List[int]] = None,
+        val_episodes: Optional[List[int]] = None,
+        seed: int = 42,
+        revision: Optional[str] = None,
+        force_cache_sync: bool = False,
+        download_videos: bool = True,
+        drop_last: bool = True,
+        pin_memory: Optional[bool] = None,
+        persistent_workers: Optional[bool] = None,
+    ):
+        super().__init__()
+        self.repo_id = repo_id
+        self.root = self._resolve_root(root, data_dir)
+        self.camera_key = camera_key
+        self.frame_sampling = (
+            {key: frame_sampling[key] for key in frame_sampling}
+            if frame_sampling is not None
+            else {}
+        )
+        self.batch_size = batch_size
+        self.val_batch_size = val_batch_size if val_batch_size is not None else batch_size
+        self.num_train_workers = num_workers
+        self.num_val_workers = num_val_workers if num_val_workers is not None else num_workers
+        self.image_size = image_size
+        self.video_backend = video_backend
+        self.tolerance_s = tolerance_s
+        self.val_fraction = float(val_fraction)
+        self.train_episodes = _to_optional_list(train_episodes)
+        self.val_episodes = _to_optional_list(val_episodes)
+        self.seed = seed
+        self.revision = revision
+        self.force_cache_sync = force_cache_sync
+        self.download_videos = download_videos
+        self.drop_last = drop_last
+        self.pin_memory = torch.cuda.is_available() if pin_memory is None else pin_memory
+        self.persistent_workers = persistent_workers
+
+        self.fps = None
+        self.train_set = None
+        self.val_set = None
+
+        if not 0.0 <= self.val_fraction < 1.0:
+            raise ValueError("`val_fraction` must be in [0.0, 1.0).")
+
+    @staticmethod
+    def _resolve_root(root: Optional[str], data_dir: Optional[str]) -> Optional[str]:
+        if root is None:
+            return None
+        root = os.fspath(root)
+        if data_dir is not None and not os.path.isabs(root):
+            return os.path.join(data_dir, root)
+        return root
+
+    def __str__(self) -> str:
+        val_samples = "disabled" if self.val_set is None else len(self.val_set)
+        camera_key = "auto" if self.camera_key is None else self.camera_key
+        return "\n".join(
+            [
+                "LeRobotDataModule",
+                f"  - Repo id: {self.repo_id}",
+                f"  - Root: {self.root}",
+                f"  - Camera key: {camera_key}",
+                f"  - Train batch size: {self.batch_size}",
+                f"  - Eval batch size: {self.val_batch_size}",
+                f"  - Number of train workers: {self.num_train_workers}",
+                f"  - Number of eval workers: {self.num_val_workers}",
+                f"  - Validation samples: {val_samples}",
+            ]
+        )
+
+    def _get_metadata(self):
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+        except ImportError as exc:
+            raise ImportError(
+                "LeRobotDataModule requires the `lerobot` package. "
+                "Install it or use a different dataset module."
+            ) from exc
+
+        return LeRobotDatasetMetadata(
+            repo_id=self.repo_id,
+            root=self.root,
+            revision=self.revision,
+            force_cache_sync=self.force_cache_sync,
+        )
+
+    def _get_delta_timestamps(self) -> Dict[str, List[float]]:
+        window_before = int(self.frame_sampling.get("window_before", self.num_frames - 1))
+        include_current = bool(self.frame_sampling.get("include_current", True))
+        end_offset = 0 if include_current else -1
+        frame_offsets = list(range(-window_before, end_offset + 1))
+
+        if len(frame_offsets) < self.num_frames:
+            raise ValueError(
+                "Frame sampling window is too small: "
+                f"got {len(frame_offsets)} candidates for {self.num_frames} requested frames."
+            )
+
+        return {self.camera_key: [offset / self.fps for offset in frame_offsets]}
+
+    @property
+    def num_frames(self) -> int:
+        return int(self.frame_sampling.get("num_frames", 4))
+
+    def _split_episodes(self, total_episodes: int):
+        all_episodes = list(range(total_episodes))
+        train_episodes = self.train_episodes
+        val_episodes = self.val_episodes
+
+        if val_episodes is not None:
+            val_set = set(val_episodes)
+            if train_episodes is None:
+                train_episodes = [ep for ep in all_episodes if ep not in val_set]
+        elif self.val_fraction > 0.0:
+            source_episodes = train_episodes if train_episodes is not None else all_episodes
+            source_episodes = list(source_episodes)
+            rng = np.random.RandomState(self.seed)
+            rng.shuffle(source_episodes)
+            val_size = max(1, int(round(len(source_episodes) * self.val_fraction)))
+            val_episodes = sorted(source_episodes[:val_size])
+            train_episodes = sorted(source_episodes[val_size:])
+
+        if train_episodes is not None and len(train_episodes) == 0:
+            raise ValueError("LeRobot training episode split is empty.")
+        if val_episodes is not None and len(val_episodes) == 0:
+            val_episodes = None
+
+        return train_episodes, val_episodes
+
+    def _make_lerobot_dataset(self, episodes):
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        except ImportError as exc:
+            raise ImportError(
+                "LeRobotDataModule requires the `lerobot` package. "
+                "Install it or use a different dataset module."
+            ) from exc
+
+        return LeRobotDataset(
+            repo_id=self.repo_id,
+            root=self.root,
+            episodes=episodes,
+            image_transforms=LeRobotImageTransform(size=self.image_size),
+            delta_timestamps=self._get_delta_timestamps(),
+            tolerance_s=self.tolerance_s,
+            revision=self.revision,
+            force_cache_sync=self.force_cache_sync,
+            download_videos=self.download_videos,
+            video_backend=self.video_backend,
+        )
+
+    def setup(self, stage=None):
+        metadata = self._get_metadata()
+        self.fps = metadata.fps
+        if self.camera_key is None:
+            if not metadata.camera_keys:
+                raise ValueError("LeRobot dataset does not define any camera keys.")
+            self.camera_key = metadata.camera_keys[0]
+        elif self.camera_key not in metadata.camera_keys:
+            raise ValueError(
+                f"Camera key `{self.camera_key}` not found. "
+                f"Available camera keys: {metadata.camera_keys}"
+            )
+
+        train_episodes, val_episodes = self._split_episodes(metadata.total_episodes)
+
+        if stage in (None, "fit") and self.train_set is None:
+            train_dataset = self._make_lerobot_dataset(train_episodes)
+            self.train_set = LeRobotVideoDataset(
+                train_dataset,
+                camera_key=self.camera_key,
+                frame_sampling=self.frame_sampling,
+                random_sampling=True,
+            )
+
+        if stage in (None, "fit", "validate") and val_episodes is not None and self.val_set is None:
+            val_dataset = self._make_lerobot_dataset(val_episodes)
+            self.val_set = LeRobotVideoDataset(
+                val_dataset,
+                camera_key=self.camera_key,
+                frame_sampling=self.frame_sampling,
+                random_sampling=False,
+            )
+
+    def _get_dataloader(
+        self, dataset, batch_size: int, num_workers: int, shuffle: bool, drop_last: bool
+    ):
+        dataloader_kwargs = {
+            "dataset": dataset,
+            "batch_size": batch_size,
+            "shuffle": shuffle,
+            "num_workers": num_workers,
+            "drop_last": drop_last,
+            "worker_init_fn": worker_init_function,
+            "pin_memory": self.pin_memory,
+        }
+
+        if num_workers > 0:
+            dataloader_kwargs["persistent_workers"] = (
+                True if self.persistent_workers is None else self.persistent_workers
+            )
+            dataloader_kwargs["prefetch_factor"] = 2
+
+        return torch.utils.data.DataLoader(**dataloader_kwargs)
+
+    def train_dataloader(self):
+        if self.train_set is None:
+            self.setup("fit")
+        return self._get_dataloader(
+            self.train_set,
+            batch_size=self.batch_size,
+            num_workers=self.num_train_workers,
+            shuffle=True,
+            drop_last=self.drop_last,
+        )
+
+    def val_dataloader(self):
+        if self.val_set is None:
+            self.setup("validate")
+        if self.val_set is None:
+            return None
+        return self._get_dataloader(
+            self.val_set,
+            batch_size=self.val_batch_size,
+            num_workers=self.num_val_workers,
+            shuffle=False,
+            drop_last=False,
+        )
 
 
 class DummyDataModule(pl.LightningDataModule):
