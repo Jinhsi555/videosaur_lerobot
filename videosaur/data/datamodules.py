@@ -655,14 +655,18 @@ class LeRobotDataModule(pl.LightningDataModule):
         frame_sampling: Optional[Dict[str, Any]] = None,
         batch_size: int = 32,
         val_batch_size: Optional[int] = None,
+        test_batch_size: Optional[int] = None,
         num_workers: int = 0,
         num_val_workers: Optional[int] = None,
+        num_test_workers: Optional[int] = None,
         image_size: Union[int, Tuple[int, int], List[int]] = 224,
         video_backend: Optional[str] = "pyav",
         tolerance_s: float = 1e-3,
         val_fraction: float = 0.0,
+        test_fraction: float = 0.0,
         train_episodes: Optional[List[int]] = None,
         val_episodes: Optional[List[int]] = None,
+        test_episodes: Optional[List[int]] = None,
         seed: int = 42,
         revision: Optional[str] = None,
         force_cache_sync: bool = False,
@@ -682,14 +686,18 @@ class LeRobotDataModule(pl.LightningDataModule):
         )
         self.batch_size = batch_size
         self.val_batch_size = val_batch_size if val_batch_size is not None else batch_size
+        self.test_batch_size = test_batch_size if test_batch_size is not None else batch_size
         self.num_train_workers = num_workers
         self.num_val_workers = num_val_workers if num_val_workers is not None else num_workers
+        self.num_test_workers = num_test_workers if num_test_workers is not None else num_workers
         self.image_size = image_size
         self.video_backend = video_backend
         self.tolerance_s = tolerance_s
         self.val_fraction = float(val_fraction)
+        self.test_fraction = float(test_fraction)
         self.train_episodes = _to_optional_list(train_episodes)
         self.val_episodes = _to_optional_list(val_episodes)
+        self.test_episodes = _to_optional_list(test_episodes)
         self.seed = seed
         self.revision = revision
         self.force_cache_sync = force_cache_sync
@@ -701,9 +709,17 @@ class LeRobotDataModule(pl.LightningDataModule):
         self.fps = None
         self.train_set = None
         self.val_set = None
+        self.test_set = None
+        self._train_episodes = None
+        self._val_episodes = None
+        self._test_episodes = None
 
         if not 0.0 <= self.val_fraction < 1.0:
             raise ValueError("`val_fraction` must be in [0.0, 1.0).")
+        if not 0.0 <= self.test_fraction < 1.0:
+            raise ValueError("`test_fraction` must be in [0.0, 1.0).")
+        if self.val_fraction + self.test_fraction >= 1.0:
+            raise ValueError("`val_fraction + test_fraction` must be smaller than 1.0.")
 
     @staticmethod
     def _resolve_root(root: Optional[str], data_dir: Optional[str]) -> Optional[str]:
@@ -715,7 +731,9 @@ class LeRobotDataModule(pl.LightningDataModule):
         return root
 
     def __str__(self) -> str:
+        train_samples = "not setup" if self.train_set is None else len(self.train_set)
         val_samples = "disabled" if self.val_set is None else len(self.val_set)
+        test_samples = "disabled" if self.test_set is None else len(self.test_set)
         camera_key = "auto" if self.camera_key is None else self.camera_key
         return "\n".join(
             [
@@ -725,9 +743,13 @@ class LeRobotDataModule(pl.LightningDataModule):
                 f"  - Camera key: {camera_key}",
                 f"  - Train batch size: {self.batch_size}",
                 f"  - Eval batch size: {self.val_batch_size}",
+                f"  - Test batch size: {self.test_batch_size}",
                 f"  - Number of train workers: {self.num_train_workers}",
                 f"  - Number of eval workers: {self.num_val_workers}",
+                f"  - Number of test workers: {self.num_test_workers}",
+                f"  - Train samples: {train_samples}",
                 f"  - Validation samples: {val_samples}",
+                f"  - Test samples: {test_samples}",
             ]
         )
 
@@ -765,30 +787,138 @@ class LeRobotDataModule(pl.LightningDataModule):
     def num_frames(self) -> int:
         return int(self.frame_sampling.get("num_frames", 4))
 
+    @staticmethod
+    def _validate_episodes(name: str, episodes, total_episodes: int):
+        if episodes is None:
+            return None
+
+        normalized = []
+        seen = set()
+        duplicates = set()
+        for episode in episodes:
+            episode = int(episode)
+            normalized.append(episode)
+            if episode in seen:
+                duplicates.add(episode)
+            seen.add(episode)
+
+        if duplicates:
+            raise ValueError(f"Duplicate episode ids in `{name}`: {sorted(duplicates)[:10]}")
+
+        invalid = [
+            episode
+            for episode in normalized
+            if episode < 0 or episode >= total_episodes
+        ]
+        if invalid:
+            raise ValueError(
+                f"Episode ids in `{name}` must be in [0, {total_episodes}), "
+                f"but got {invalid[:10]}."
+            )
+
+        return sorted(normalized)
+
+    @staticmethod
+    def _check_episode_overlap(splits: Dict[str, Optional[List[int]]]):
+        split_sets = {
+            name: set(episodes)
+            for name, episodes in splits.items()
+            if episodes is not None
+        }
+        split_names = list(split_sets)
+        for idx, left_name in enumerate(split_names):
+            for right_name in split_names[idx + 1 :]:
+                overlap = sorted(split_sets[left_name] & split_sets[right_name])
+                if overlap:
+                    raise ValueError(
+                        f"LeRobot episode splits `{left_name}` and `{right_name}` overlap: "
+                        f"{overlap[:10]}"
+                    )
+
     def _split_episodes(self, total_episodes: int):
         all_episodes = list(range(total_episodes))
-        train_episodes = self.train_episodes
-        val_episodes = self.val_episodes
+        train_episodes = self._validate_episodes(
+            "train_episodes", self.train_episodes, total_episodes
+        )
+        val_episodes = self._validate_episodes(
+            "val_episodes", self.val_episodes, total_episodes
+        )
+        test_episodes = self._validate_episodes(
+            "test_episodes", self.test_episodes, total_episodes
+        )
 
-        if val_episodes is not None:
-            val_set = set(val_episodes)
-            if train_episodes is None:
-                train_episodes = [ep for ep in all_episodes if ep not in val_set]
-        elif self.val_fraction > 0.0:
-            source_episodes = train_episodes if train_episodes is not None else all_episodes
-            source_episodes = list(source_episodes)
+        self._check_episode_overlap(
+            {
+                "train_episodes": train_episodes,
+                "val_episodes": val_episodes,
+                "test_episodes": test_episodes,
+            }
+        )
+
+        if train_episodes is None:
+            reserved_episodes = set()
+            if val_episodes is not None:
+                reserved_episodes.update(val_episodes)
+            if test_episodes is not None:
+                reserved_episodes.update(test_episodes)
+            source_episodes = [
+                episode for episode in all_episodes if episode not in reserved_episodes
+            ]
+        else:
+            source_episodes = list(train_episodes)
+
+        split_source = list(source_episodes)
+        needs_random_split = (
+            (val_episodes is None and self.val_fraction > 0.0)
+            or (test_episodes is None and self.test_fraction > 0.0)
+        )
+        if needs_random_split:
             rng = np.random.RandomState(self.seed)
-            rng.shuffle(source_episodes)
-            val_size = max(1, int(round(len(source_episodes) * self.val_fraction)))
-            val_episodes = sorted(source_episodes[:val_size])
-            train_episodes = sorted(source_episodes[val_size:])
+            rng.shuffle(split_source)
+
+            val_size = (
+                0
+                if val_episodes is not None or self.val_fraction == 0.0
+                else max(1, int(round(len(split_source) * self.val_fraction)))
+            )
+            test_size = (
+                0
+                if test_episodes is not None or self.test_fraction == 0.0
+                else max(1, int(round(len(split_source) * self.test_fraction)))
+            )
+            if val_size + test_size >= len(split_source):
+                raise ValueError(
+                    "LeRobot episode fractions leave no training episodes: "
+                    f"source={len(split_source)}, val={val_size}, test={test_size}."
+                )
+
+            offset = 0
+            if val_size:
+                val_episodes = sorted(split_source[offset : offset + val_size])
+                offset += val_size
+            if test_size:
+                test_episodes = sorted(split_source[offset : offset + test_size])
+                offset += test_size
+            train_episodes = sorted(split_source[offset:])
+        else:
+            train_episodes = sorted(split_source)
 
         if train_episodes is not None and len(train_episodes) == 0:
             raise ValueError("LeRobot training episode split is empty.")
         if val_episodes is not None and len(val_episodes) == 0:
             val_episodes = None
+        if test_episodes is not None and len(test_episodes) == 0:
+            test_episodes = None
 
-        return train_episodes, val_episodes
+        self._check_episode_overlap(
+            {
+                "train_episodes": train_episodes,
+                "val_episodes": val_episodes,
+                "test_episodes": test_episodes,
+            }
+        )
+
+        return train_episodes, val_episodes, test_episodes
 
     def _make_lerobot_dataset(self, episodes):
         try:
@@ -825,7 +955,12 @@ class LeRobotDataModule(pl.LightningDataModule):
                 f"Available camera keys: {metadata.camera_keys}"
             )
 
-        train_episodes, val_episodes = self._split_episodes(metadata.total_episodes)
+        train_episodes, val_episodes, test_episodes = self._split_episodes(
+            metadata.total_episodes
+        )
+        self._train_episodes = train_episodes
+        self._val_episodes = val_episodes
+        self._test_episodes = test_episodes
 
         if stage in (None, "fit") and self.train_set is None:
             train_dataset = self._make_lerobot_dataset(train_episodes)
@@ -840,6 +975,15 @@ class LeRobotDataModule(pl.LightningDataModule):
             val_dataset = self._make_lerobot_dataset(val_episodes)
             self.val_set = LeRobotVideoDataset(
                 val_dataset,
+                camera_key=self.camera_key,
+                frame_sampling=self.frame_sampling,
+                random_sampling=False,
+            )
+
+        if stage in (None, "test") and test_episodes is not None and self.test_set is None:
+            test_dataset = self._make_lerobot_dataset(test_episodes)
+            self.test_set = LeRobotVideoDataset(
+                test_dataset,
                 camera_key=self.camera_key,
                 frame_sampling=self.frame_sampling,
                 random_sampling=False,
@@ -886,6 +1030,19 @@ class LeRobotDataModule(pl.LightningDataModule):
             self.val_set,
             batch_size=self.val_batch_size,
             num_workers=self.num_val_workers,
+            shuffle=False,
+            drop_last=False,
+        )
+
+    def test_dataloader(self):
+        if self.test_set is None:
+            self.setup("test")
+        if self.test_set is None:
+            return None
+        return self._get_dataloader(
+            self.test_set,
+            batch_size=self.test_batch_size,
+            num_workers=self.num_test_workers,
             shuffle=False,
             drop_last=False,
         )
