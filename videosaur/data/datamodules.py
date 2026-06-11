@@ -590,57 +590,48 @@ class LeRobotVideoDataset(torch.utils.data.Dataset):
         self,
         dataset,
         camera_key: str,
-        frame_sampling: Dict[str, Any],
-        random_sampling: bool,
+        frame_offsets: List[int],
+        episodes: Optional[List[int]] = None,
     ):
         super().__init__()
         self.dataset = dataset
         self.camera_key = camera_key
-        self.mode = frame_sampling.get("mode", "random_frames")
-        self.num_frames = int(frame_sampling.get("num_frames", 4))
-        self.random_sampling = random_sampling
-
-        if self.mode not in ("random_frames", "contiguous_clip"):
-            raise ValueError(
-                f"Unsupported LeRobot frame sampling mode `{self.mode}`. "
-                "Supported modes are `random_frames` and `contiguous_clip`."
-            )
-        if self.num_frames <= 0:
-            raise ValueError("`frame_sampling.num_frames` must be positive.")
+        self.frame_offsets = frame_offsets
+        self.episodes = None if episodes is None else {int(episode) for episode in episodes}
+        self.valid_indices = self._get_valid_indices()
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.valid_indices)
 
-    def _sample_indices(self, num_candidates: int) -> torch.Tensor:
-        if num_candidates < self.num_frames:
+    def _get_valid_indices(self) -> List[int]:
+        min_offset = min(self.frame_offsets)
+        max_offset = max(self.frame_offsets)
+        episodes = self.episodes
+        if episodes is None:
+            episodes = range(len(self.dataset.meta.episodes))
+
+        valid_indices = []
+        for episode_index in sorted(episodes):
+            episode = self.dataset.meta.episodes[int(episode_index)]
+            episode_start = int(episode["dataset_from_index"])
+            episode_end = int(episode["dataset_to_index"])
+            start = max(episode_start, episode_start - min_offset)
+            stop = min(episode_end, episode_end - max_offset)
+            if start < stop:
+                valid_indices.extend(range(start, stop))
+
+        if not valid_indices:
             raise ValueError(
-                f"Need at least {self.num_frames} candidate frames, but got {num_candidates}."
+                "No LeRobot samples have enough context for the configured frame window."
             )
-
-        if self.mode == "contiguous_clip":
-            max_start = num_candidates - self.num_frames
-            if self.random_sampling and max_start > 0:
-                start = torch.randint(max_start + 1, (1,)).item()
-            else:
-                start = max_start // 2
-            return torch.arange(start, start + self.num_frames)
-
-        if self.random_sampling:
-            indices = torch.randperm(num_candidates)[: self.num_frames]
-            return indices.sort().values
-
-        if self.num_frames == 1:
-            return torch.tensor([num_candidates - 1], dtype=torch.long)
-        return torch.linspace(0, num_candidates - 1, self.num_frames).round().long()
+        return valid_indices
 
     def __getitem__(self, idx):
-        item = self.dataset[idx]
+        item = self.dataset[self.valid_indices[idx]]
         video = item[self.camera_key]
         if video.ndim == 3:
             video = video.unsqueeze(0)
-
-        indices = self._sample_indices(video.shape[0])
-        return {"video": video[indices]}
+        return {"video": video}
 
 
 class LeRobotDataModule(pl.LightningDataModule):
@@ -713,6 +704,7 @@ class LeRobotDataModule(pl.LightningDataModule):
         self._train_episodes = None
         self._val_episodes = None
         self._test_episodes = None
+        self._lerobot_dataset = None
 
         if not 0.0 <= self.val_fraction < 1.0:
             raise ValueError("`val_fraction` must be in [0.0, 1.0).")
@@ -769,19 +761,14 @@ class LeRobotDataModule(pl.LightningDataModule):
             force_cache_sync=self.force_cache_sync,
         )
 
-    def _get_delta_timestamps(self) -> Dict[str, List[float]]:
-        window_before = int(self.frame_sampling.get("window_before", self.num_frames - 1))
+    def _get_frame_offsets(self) -> List[int]:
+        num_frames = self.num_frames
         include_current = bool(self.frame_sampling.get("include_current", True))
         end_offset = 0 if include_current else -1
-        frame_offsets = list(range(-window_before, end_offset + 1))
+        return list(range(end_offset - num_frames + 1, end_offset + 1))
 
-        if len(frame_offsets) < self.num_frames:
-            raise ValueError(
-                "Frame sampling window is too small: "
-                f"got {len(frame_offsets)} candidates for {self.num_frames} requested frames."
-            )
-
-        return {self.camera_key: [offset / self.fps for offset in frame_offsets]}
+    def _get_delta_timestamps(self) -> Dict[str, List[float]]:
+        return {self.camera_key: [offset / self.fps for offset in self._get_frame_offsets()]}
 
     @property
     def num_frames(self) -> int:
@@ -920,7 +907,10 @@ class LeRobotDataModule(pl.LightningDataModule):
 
         return train_episodes, val_episodes, test_episodes
 
-    def _make_lerobot_dataset(self, episodes):
+    def _get_lerobot_dataset(self):
+        if self._lerobot_dataset is not None:
+            return self._lerobot_dataset
+
         try:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
         except ImportError as exc:
@@ -929,10 +919,10 @@ class LeRobotDataModule(pl.LightningDataModule):
                 "Install it or use a different dataset module."
             ) from exc
 
-        return LeRobotDataset(
+        self._lerobot_dataset = LeRobotDataset(
             repo_id=self.repo_id,
             root=self.root,
-            episodes=episodes,
+            episodes=None,
             image_transforms=LeRobotImageTransform(size=self.image_size),
             delta_timestamps=self._get_delta_timestamps(),
             tolerance_s=self.tolerance_s,
@@ -941,6 +931,7 @@ class LeRobotDataModule(pl.LightningDataModule):
             download_videos=self.download_videos,
             video_backend=self.video_backend,
         )
+        return self._lerobot_dataset
 
     def setup(self, stage=None):
         metadata = self._get_metadata()
@@ -962,31 +953,30 @@ class LeRobotDataModule(pl.LightningDataModule):
         self._val_episodes = val_episodes
         self._test_episodes = test_episodes
 
+        lerobot_dataset = self._get_lerobot_dataset()
+
         if stage in (None, "fit") and self.train_set is None:
-            train_dataset = self._make_lerobot_dataset(train_episodes)
             self.train_set = LeRobotVideoDataset(
-                train_dataset,
+                lerobot_dataset,
                 camera_key=self.camera_key,
-                frame_sampling=self.frame_sampling,
-                random_sampling=True,
+                frame_offsets=self._get_frame_offsets(),
+                episodes=train_episodes,
             )
 
         if stage in (None, "fit", "validate") and val_episodes is not None and self.val_set is None:
-            val_dataset = self._make_lerobot_dataset(val_episodes)
             self.val_set = LeRobotVideoDataset(
-                val_dataset,
+                lerobot_dataset,
                 camera_key=self.camera_key,
-                frame_sampling=self.frame_sampling,
-                random_sampling=False,
+                frame_offsets=self._get_frame_offsets(),
+                episodes=val_episodes,
             )
 
         if stage in (None, "test") and test_episodes is not None and self.test_set is None:
-            test_dataset = self._make_lerobot_dataset(test_episodes)
             self.test_set = LeRobotVideoDataset(
-                test_dataset,
+                lerobot_dataset,
                 camera_key=self.camera_key,
-                frame_sampling=self.frame_sampling,
-                random_sampling=False,
+                frame_offsets=self._get_frame_offsets(),
+                episodes=test_episodes,
             )
 
     def _get_dataloader(

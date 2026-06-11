@@ -130,10 +130,7 @@ dataset:
   tolerance_s: 1e-3
 
   frame_sampling:
-    mode: random_frames
-    window_before: 15
     num_frames: 4
-    include_current: true
 
   val_fraction: 0.05
   test_fraction: 0.05

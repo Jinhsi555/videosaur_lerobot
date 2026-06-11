@@ -1,4 +1,5 @@
 import argparse
+import collections
 import logging
 import os
 import pathlib
@@ -10,6 +11,7 @@ import pytorch_lightning as pl
 import torch
 from omegaconf import OmegaConf
 from pytorch_lightning.utilities import rank_zero_info as log_info
+from pytorch_lightning.utilities.model_summary import ModelSummary
 
 from videosaur import configuration, data, metrics, models, utils
 
@@ -149,6 +151,47 @@ def _setup_trainer_config(trainer_config: Dict[str, Any]) -> Dict[str, Any]:
     return trainer_config
 
 
+def _format_dtype_counts(counts: collections.Counter) -> str:
+    return ", ".join(f"{dtype}: {count:,}" for dtype, count in sorted(counts.items()))
+
+
+def _format_model_dtype_summary(model: pl.LightningModule) -> str:
+    parameter_dtypes = collections.Counter()
+    trainable_parameter_dtypes = collections.Counter()
+    buffer_dtypes = collections.Counter()
+
+    for parameter in model.parameters():
+        dtype = str(parameter.dtype).replace("torch.", "")
+        parameter_dtypes[dtype] += parameter.numel()
+        if parameter.requires_grad:
+            trainable_parameter_dtypes[dtype] += parameter.numel()
+
+    for buffer in model.buffers():
+        dtype = str(buffer.dtype).replace("torch.", "")
+        buffer_dtypes[dtype] += buffer.numel()
+
+    lines = ["Model dtype summary:"]
+    if parameter_dtypes:
+        lines.append(f"  Parameters: {_format_dtype_counts(parameter_dtypes)}")
+        lines.append(f"  Trainable parameters: {_format_dtype_counts(trainable_parameter_dtypes)}")
+    else:
+        lines.append("  Parameters: none")
+
+    if buffer_dtypes:
+        lines.append(f"  Buffers: {_format_dtype_counts(buffer_dtypes)}")
+
+    return "\n".join(lines)
+
+
+def _print_model_startup_summary(args, model: pl.LightningModule) -> None:
+    if args.quiet or utils.get_rank() != 0:
+        return
+
+    max_depth = -1 if args.verbose else 1
+    print(f"Model summary before training:\n{ModelSummary(model, max_depth=max_depth)}", flush=True)
+    print(_format_model_dtype_summary(model), flush=True)
+
+
 def main(args, config_overrides=None):
     rank_zero = utils.get_rank() == 0
     if config_overrides is None:
@@ -271,6 +314,7 @@ def main(args, config_overrides=None):
     else:
         log_info("Starting training from scratch")
 
+    _print_model_startup_summary(args, model)
     trainer.fit(model=model, datamodule=dataset, ckpt_path=ckpt_path)
 
     if "checkpointer" in callbacks:
