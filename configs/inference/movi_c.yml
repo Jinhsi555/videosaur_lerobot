@@ -1,6 +1,6 @@
-checkpoint: checkpoints/videosaur-movi-c.ckpt
-model_config: configs/videosaur/movi_c.yml
-n_slots: 11
+checkpoint: logs/videosaur/2026-06-11-15-51-53_lerobot_something_something_v2_2/checkpoints/step=1000.ckpt
+model_config: configs/videosaur/lerobot_something_something_v2.yml
+n_slots: 6
 input:
   path: docs/static/videos/video.mp4
   type: video

@@ -1,9 +1,5 @@
-experiment_group: videosaur
+experiment_group: videosaur_debug
 experiment_name: lerobot_something_something_v2
-checkpoint_every_n_steps: 1000
-checkpoint_monitor: val/loss
-checkpoint_mode: min
-checkpoint_save_top_k: 5
 
 globals:
   NUM_SLOTS: 11

@@ -1,6 +1,3 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
 cd /mnt/workspace/wlb/videosaur_lerobot
 source env_exports/activate_videosaur_ppu.sh
 
@@ -20,19 +17,4 @@ export NODE_RANK="${NODE_RANK:-${GROUP_RANK:-0}}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-${LOCAL_WORLD_SIZE:-1}}"
 export WORLD_SIZE="${WORLD_SIZE:-$((NNODES * NPROC_PER_NODE))}"
 
-mkdir -p "${HUGGINGFACE_HUB_CACHE}"
-mkdir -p "${TORCH_HOME}"
-
-echo "torch.distributed.run: nnodes=${NNODES} node_rank=${NODE_RANK} nproc_per_node=${NPROC_PER_NODE} master=${MASTER_ADDR}:${MASTER_PORT} world_size=${WORLD_SIZE}"
-
-python -m torch.distributed.run \
-  --nnodes="${NNODES}" \
-  --node-rank="${NODE_RANK}" \
-  --nproc-per-node="${NPROC_PER_NODE}" \
-  --master-addr="${MASTER_ADDR}" \
-  --master-port="${MASTER_PORT}" \
-  -m videosaur.train \
-  configs/videosaur/lerobot_something_something_v2.yml \
-  trainer.devices="${NPROC_PER_NODE}" \
-  globals.BATCH_SIZE_PER_GPU=32 \
-  globals.NUM_GPUS="${WORLD_SIZE}"
+python -m videosaur.inference --config configs/inference/movi_c.yml

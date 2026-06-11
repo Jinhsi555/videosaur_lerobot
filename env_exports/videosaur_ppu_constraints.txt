@@ -1,0 +1,4 @@
+# Keep the Aliyun PPU-adapted torch stack from the base image.
+# Use this file with: python -m pip install -c env_exports/videosaur_ppu_constraints.txt ...
+torch==2.6.0+v0.1.0.ppu2.1.0.oe
+torchvision==0.21.0+v0.1.0.ppu2.1.0.ce

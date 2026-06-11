@@ -15,7 +15,11 @@ import matplotlib.pyplot as plt
 def load_model_from_checkpoint(checkpoint_path: str, config_path: str):
     config = configuration.load_config(config_path)
     model = models.build(config.model, config.optimizer)
-    checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location=torch.device("cpu"),
+        weights_only=False,
+    )
     model.load_state_dict(checkpoint['state_dict'])
     model.eval()
     return model, config
