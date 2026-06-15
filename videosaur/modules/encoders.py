@@ -222,3 +222,10 @@ class TimmExtractor(nn.Module):
                 return outputs
         else:
             return outputs
+
+if __name__ == "__main__":
+    # Example usage
+    encoder = TimmExtractor(model="vit_base_patch16_224", pretrained=True, features="vit_block12")
+    dummy_input = torch.randn(1, 3, 224, 224)
+    output = encoder(dummy_input)
+    print(output.shape)

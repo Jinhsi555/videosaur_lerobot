@@ -1,12 +1,15 @@
-checkpoint: logs/videosaur/2026-06-11-15-51-53_lerobot_something_something_v2_2/checkpoints/step=1000.ckpt
+checkpoint: logs/videosaur/2026-06-11-15-51-53_lerobot_something_something_v2_2/checkpoints/step=100000-v1.ckpt
 model_config: configs/videosaur/lerobot_something_something_v2.yml
-n_slots: 6
+n_slots: 11
+fps: 30
+device: auto
 input:
-  path: docs/static/videos/video.mp4
+  path: /mnt/workspace/wlb/videosaur_lerobot/inference_output/2358.mp4
   type: video
   transforms:
-    use_movi_normalization: true
+    style: lerobot
+    use_movi_normalization: false
     dataset_type: video
     input_size: 224
 output:
-  save_path: docs/static/videos/video_masks.mp4
+  save_path: /mnt/workspace/wlb/videosaur_lerobot/inference_output/2358-mask-11-slots.mp4
