@@ -32,7 +32,7 @@ python -m torch.distributed.run \
   --master-addr="${MASTER_ADDR}" \
   --master-port="${MASTER_PORT}" \
   -m videosaur.train \
-  configs/videosaur/lerobot_something_something_v2.yml \
+  configs/videosaur/lerobot_mixed_dataset.yml \
   trainer.devices="${NPROC_PER_NODE}" \
   globals.BATCH_SIZE_PER_GPU=32 \
   globals.NUM_GPUS="${WORLD_SIZE}"
