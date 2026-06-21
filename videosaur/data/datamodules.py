@@ -3,6 +3,7 @@ import math
 import os
 import tempfile
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
@@ -539,12 +540,60 @@ def _to_plain_dict(value):
     return dict(value)
 
 
+def _load_jsonl(path: Union[str, os.PathLike]) -> List[Dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
 def _to_size_tuple(value: Union[int, Tuple[int, int], List[int]]) -> Tuple[int, int]:
     if isinstance(value, int):
         return (value, value)
     if isinstance(value, (list, tuple, ListConfig)) and len(value) == 2:
         return (int(value[0]), int(value[1]))
     raise ValueError(f"Expected int or pair for image size, but got {value}")
+
+
+def _normalize_lerobot_format(value: Optional[str]) -> str:
+    if value is None:
+        return "auto"
+    value = str(value).lower()
+    aliases = {
+        "2": "v2",
+        "2.1": "v2",
+        "v2.1": "v2",
+        "3": "v3",
+        "3.0": "v3",
+        "v3.0": "v3",
+    }
+    value = aliases.get(value, value)
+    if value not in ("auto", "v2", "v3"):
+        raise ValueError("`lerobot_format` must be one of {'auto', 'v2', 'v3'}.")
+    return value
+
+
+def _resolve_lerobot_format(
+    requested_format: Optional[str],
+    root: Optional[str],
+    *,
+    force_cache_sync: bool = False,
+) -> str:
+    requested_format = _normalize_lerobot_format(requested_format)
+    if requested_format != "auto":
+        return requested_format
+    if root is None or force_cache_sync:
+        return "v3"
+
+    root_path = Path(root)
+    info_path = root_path / "meta" / "info.json"
+    try:
+        with open(info_path, "r", encoding="utf-8") as f:
+            codebase_version = str(json.load(f).get("codebase_version", "")).lower()
+    except FileNotFoundError:
+        codebase_version = ""
+
+    if codebase_version.startswith("v2") or (root_path / "meta" / "episodes.jsonl").exists():
+        return "v2"
+    return "v3"
 
 
 class _LeRobotInfoMetadata:
@@ -572,6 +621,139 @@ class _LeRobotInfoMetadata:
     @property
     def total_episodes(self) -> int:
         return int(self.info["total_episodes"])
+
+
+class LeRobotV2Metadata:
+    """Minimal v2.1 metadata view exposing the v3 fields used by this module."""
+
+    def __init__(self, repo_id: str, root: Union[str, os.PathLike]):
+        self.repo_id = repo_id
+        self.root = Path(root)
+        self.info = self._load_info()
+        self.tasks = self._load_tasks()
+        self.episodes = self._load_episodes()
+
+    def _load_info(self) -> Dict[str, Any]:
+        info_path = self.root / "meta" / "info.json"
+        with open(info_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        codebase_version = str(info.get("codebase_version", "")).lower()
+        if codebase_version and not codebase_version.startswith("v2"):
+            raise ValueError(
+                f"Expected LeRobot v2 metadata at `{self.root}`, "
+                f"but found codebase_version={info.get('codebase_version')!r}."
+            )
+        return info
+
+    def _load_tasks(self) -> Dict[int, str]:
+        path = self.root / "meta" / "tasks.jsonl"
+        if not path.exists():
+            return {}
+        return {
+            int(item["task_index"]): item["task"]
+            for item in sorted(_load_jsonl(path), key=lambda item: int(item["task_index"]))
+        }
+
+    def _load_episodes(self) -> List[Dict[str, Any]]:
+        path = self.root / "meta" / "episodes.jsonl"
+        if not path.exists():
+            raise FileNotFoundError(f"LeRobot v2 dataset is missing `{path}`.")
+
+        episodes = sorted(_load_jsonl(path), key=lambda item: int(item["episode_index"]))
+        if len(episodes) != int(self.info["total_episodes"]):
+            raise ValueError(
+                f"LeRobot v2 metadata at `{self.root}` declares "
+                f"{self.info['total_episodes']} episodes but has {len(episodes)} rows."
+            )
+
+        current_index = 0
+        indexed_episodes = []
+        for expected_idx, episode in enumerate(episodes):
+            episode_index = int(episode["episode_index"])
+            if episode_index != expected_idx:
+                raise ValueError(
+                    "LeRobot v2 episode indices must be contiguous from zero. "
+                    f"Expected {expected_idx}, got {episode_index}."
+                )
+            length = int(episode["length"])
+            indexed_episodes.append(
+                {
+                    **episode,
+                    "episode_index": episode_index,
+                    "length": length,
+                    "dataset_from_index": current_index,
+                    "dataset_to_index": current_index + length,
+                }
+            )
+            current_index += length
+        return indexed_episodes
+
+    @property
+    def fps(self):
+        return self.info["fps"]
+
+    @property
+    def features(self) -> Dict[str, Dict[str, Any]]:
+        return self.info["features"]
+
+    @property
+    def camera_keys(self) -> List[str]:
+        return [
+            key
+            for key, feature in self.features.items()
+            if feature["dtype"] in ("video", "image")
+        ]
+
+    @property
+    def video_keys(self) -> List[str]:
+        return [key for key, feature in self.features.items() if feature["dtype"] == "video"]
+
+    @property
+    def image_keys(self) -> List[str]:
+        return [key for key, feature in self.features.items() if feature["dtype"] == "image"]
+
+    @property
+    def total_episodes(self) -> int:
+        return int(self.info["total_episodes"])
+
+    @property
+    def total_frames(self) -> int:
+        return int(self.info["total_frames"])
+
+    @property
+    def data_path(self) -> str:
+        return self.info["data_path"]
+
+    @property
+    def video_path(self) -> Optional[str]:
+        return self.info.get("video_path")
+
+    @property
+    def chunks_size(self) -> int:
+        return int(self.info.get("chunks_size", 1000))
+
+    def _path_kwargs(self, episode_index: int, video_key: Optional[str] = None) -> Dict[str, Any]:
+        episode_chunk = int(episode_index) // self.chunks_size
+        return {
+            "episode_chunk": episode_chunk,
+            "chunk_index": episode_chunk,
+            "file_index": int(episode_index),
+            "episode_index": int(episode_index),
+            "video_key": video_key,
+        }
+
+    def get_data_file_path(self, episode_index: int) -> Path:
+        return Path(self.data_path.format(**self._path_kwargs(episode_index)))
+
+    def get_video_file_path(self, episode_index: int, video_key: str) -> Path:
+        if self.video_path is None:
+            raise ValueError(f"LeRobot v2 dataset `{self.repo_id}` does not define videos.")
+        return Path(
+            self.video_path.format(**self._path_kwargs(episode_index, video_key=video_key))
+        )
+
+    def task_string(self, task_index: int) -> str:
+        return self.tasks.get(int(task_index), "")
 
 
 def _try_load_lerobot_info_metadata(root: Optional[str], force_cache_sync: bool = False):
@@ -640,6 +822,214 @@ class LeRobotImageTransform:
         return images.squeeze(0) if single_image else images
 
 
+class LeRobotV2Dataset(torch.utils.data.Dataset):
+    """Read a local LeRobot v2.1 dataset through the v3 fields used by VideoSAUR."""
+
+    def __init__(
+        self,
+        repo_id: str,
+        root: Union[str, os.PathLike],
+        episodes: Optional[List[int]] = None,
+        image_transforms: Optional[Callable] = None,
+        delta_timestamps: Optional[Dict[str, List[float]]] = None,
+        tolerance_s: float = 1e-3,
+        video_backend: Optional[str] = "pyav",
+    ):
+        super().__init__()
+        if root is None:
+            raise ValueError("LeRobot v2 datasets must be local and require `root`.")
+
+        self.repo_id = repo_id
+        self.root = Path(root)
+        self.episodes = None if episodes is None else [int(episode) for episode in episodes]
+        self.image_transforms = image_transforms
+        self.delta_timestamps = delta_timestamps
+        self.tolerance_s = tolerance_s
+        self.video_backend = video_backend
+        self.meta = LeRobotV2Metadata(repo_id=repo_id, root=self.root)
+        self.features = self.meta.features
+
+        try:
+            from lerobot.datasets.utils import check_delta_timestamps, get_delta_indices
+        except ImportError as exc:
+            raise ImportError(
+                "LeRobotV2Dataset requires the `lerobot` package utilities."
+            ) from exc
+
+        self.rows = self._load_rows()
+        self._absolute_to_relative_idx = {
+            int(row["index"]): relative_index for relative_index, row in enumerate(self.rows)
+        }
+        if self.episodes is None:
+            expected_indices = list(range(len(self.rows)))
+            actual_indices = [int(row["index"]) for row in self.rows]
+            if actual_indices == expected_indices:
+                self._absolute_to_relative_idx = None
+
+        self.delta_indices = None
+        if self.delta_timestamps is not None:
+            check_delta_timestamps(self.delta_timestamps, self.meta.fps, self.tolerance_s)
+            self.delta_indices = get_delta_indices(self.delta_timestamps, self.meta.fps)
+
+    def _load_rows(self) -> List[Dict[str, Any]]:
+        try:
+            import pyarrow.parquet as pq
+        except ImportError as exc:
+            raise ImportError("LeRobotV2Dataset requires `pyarrow` to read parquet files.") from exc
+
+        episodes = (
+            list(range(self.meta.total_episodes))
+            if self.episodes is None
+            else sorted(self.episodes)
+        )
+        rows = []
+        for episode_index in episodes:
+            table = pq.read_table(self.root / self.meta.get_data_file_path(episode_index))
+            columns = table.to_pydict()
+            for row_index in range(table.num_rows):
+                rows.append({key: values[row_index] for key, values in columns.items()})
+        return rows
+
+    def __len__(self):
+        return len(self.rows)
+
+    @staticmethod
+    def _scalar_item(value):
+        if torch.is_tensor(value):
+            return value.reshape(-1)[0].item()
+        if isinstance(value, np.ndarray):
+            return value.reshape(-1)[0].item()
+        if isinstance(value, (list, tuple)):
+            return value[0]
+        return value
+
+    @staticmethod
+    def _stack_values(values):
+        if torch.is_tensor(values):
+            return values
+        return torch.stack(
+            [value if torch.is_tensor(value) else torch.as_tensor(value) for value in values]
+        )
+
+    def _relative_indices(self, absolute_indices: List[int]) -> List[int]:
+        if self._absolute_to_relative_idx is None:
+            return absolute_indices
+        return [self._absolute_to_relative_idx[int(index)] for index in absolute_indices]
+
+    def _get_query_indices(
+        self, absolute_index: int, episode_index: int
+    ) -> Tuple[Dict[str, List[int]], Dict[str, torch.Tensor]]:
+        episode = self.meta.episodes[int(episode_index)]
+        episode_start = int(episode["dataset_from_index"])
+        episode_end = int(episode["dataset_to_index"])
+        query_indices = {
+            key: [
+                max(episode_start, min(episode_end - 1, absolute_index + delta))
+                for delta in delta_indices
+            ]
+            for key, delta_indices in self.delta_indices.items()
+        }
+        padding = {
+            f"{key}_is_pad": torch.BoolTensor(
+                [
+                    absolute_index + delta < episode_start
+                    or absolute_index + delta >= episode_end
+                    for delta in delta_indices
+                ]
+            )
+            for key, delta_indices in self.delta_indices.items()
+        }
+        return query_indices, padding
+
+    def _query_hf_dataset(self, query_indices: Dict[str, List[int]]) -> Dict[str, torch.Tensor]:
+        result = {}
+        for key, absolute_indices in query_indices.items():
+            if key in self.meta.video_keys:
+                continue
+            relative_indices = self._relative_indices(absolute_indices)
+            values = [self.rows[index][key] for index in relative_indices]
+            result[key] = self._stack_values(values)
+        return result
+
+    def _get_query_timestamps(
+        self,
+        current_timestamp: float,
+        episode_index: int,
+        query_indices: Optional[Dict[str, List[int]]] = None,
+    ) -> Dict[str, List[float]]:
+        video_keys = (
+            self.meta.video_keys
+            if self.delta_timestamps is None
+            else [key for key in self.meta.video_keys if key in self.delta_timestamps]
+        )
+        if query_indices is None:
+            return {key: [current_timestamp] for key in video_keys}
+
+        episode_start = int(self.meta.episodes[int(episode_index)]["dataset_from_index"])
+        return {
+            key: [
+                (int(absolute_index) - episode_start) / float(self.meta.fps)
+                for absolute_index in query_indices[key]
+            ]
+            for key in video_keys
+            if key in query_indices
+        }
+
+    def _query_videos(
+        self, query_timestamps: Dict[str, List[float]], episode_index: int
+    ) -> Dict[str, torch.Tensor]:
+        try:
+            from lerobot.datasets.video_utils import decode_video_frames
+        except ImportError as exc:
+            raise ImportError(
+                "LeRobotV2Dataset requires LeRobot video decoding utilities."
+            ) from exc
+
+        item = {}
+        for video_key, timestamps in query_timestamps.items():
+            video_path = self.root / self.meta.get_video_file_path(episode_index, video_key)
+            frames = decode_video_frames(
+                video_path,
+                timestamps,
+                self.tolerance_s,
+                self.video_backend,
+            )
+            item[video_key] = frames.squeeze(0)
+        return item
+
+    def __getitem__(self, idx):
+        item = {
+            key: value if isinstance(value, str) or value is None else torch.as_tensor(value)
+            for key, value in self.rows[idx].items()
+        }
+        episode_index = int(self._scalar_item(item["episode_index"]))
+        absolute_index = int(self._scalar_item(item["index"]))
+
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(absolute_index, episode_index)
+            item = {**item, **padding}
+            item.update(self._query_hf_dataset(query_indices))
+
+        if self.meta.video_keys:
+            current_timestamp = float(self._scalar_item(item["timestamp"]))
+            query_timestamps = self._get_query_timestamps(
+                current_timestamp,
+                episode_index,
+                query_indices,
+            )
+            item.update(self._query_videos(query_timestamps, episode_index))
+
+        if self.image_transforms is not None:
+            for camera_key in self.meta.camera_keys:
+                if camera_key in item:
+                    item[camera_key] = self.image_transforms(item[camera_key])
+
+        task_index = int(self._scalar_item(item.get("task_index", -1)))
+        item["task"] = self.meta.task_string(task_index)
+        return item
+
+
 class LeRobotVideoDataset(torch.utils.data.Dataset):
     """Adapts a LeRobotDataset sample to VideoSAUR's `video` input key."""
 
@@ -705,6 +1095,141 @@ class LeRobotVideoDataset(torch.utils.data.Dataset):
         return item
 
 
+class SequentialShardSampler(torch.utils.data.Sampler):
+    """Shard a sequential dataset across ranks without padding or duplication."""
+
+    def __init__(self, dataset, rank: int, world_size: int):
+        self.dataset = dataset
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        if self.world_size <= 0:
+            raise ValueError("`world_size` must be positive.")
+        if not 0 <= self.rank < self.world_size:
+            raise ValueError(f"`rank` must be in [0, {self.world_size}), got {self.rank}.")
+
+    def __iter__(self):
+        return iter(range(self.rank, len(self.dataset), self.world_size))
+
+    def __len__(self):
+        dataset_len = len(self.dataset)
+        if self.rank >= dataset_len:
+            return 0
+        return ((dataset_len - 1 - self.rank) // self.world_size) + 1
+
+
+class LeRobotSlotCacheDataset(torch.utils.data.Dataset):
+    """LeRobot video samples with stable per-frame provenance for slot caching."""
+
+    def __init__(
+        self,
+        dataset,
+        camera_key: str,
+        frame_offsets: List[int],
+        episodes: List[int],
+        *,
+        dataset_index: int,
+        split_index: int,
+        row_offset: int = 0,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.camera_key = camera_key
+        self.frame_offsets = [int(offset) for offset in frame_offsets]
+        self.episodes = [int(episode) for episode in episodes]
+        self.dataset_index = int(dataset_index)
+        self.split_index = int(split_index)
+        self.row_offset = int(row_offset)
+        self.entries = self._make_entries()
+
+    def __len__(self):
+        return len(self.entries)
+
+    def _to_dataset_index(self, absolute_index: int):
+        absolute_to_relative = getattr(self.dataset, "_absolute_to_relative_idx", None)
+        if absolute_to_relative is None:
+            return absolute_index
+        return absolute_to_relative.get(absolute_index)
+
+    def _make_context(self, absolute_index: int, episode_start: int, episode_end: int):
+        context_absolute_indices = []
+        context_frame_indices = []
+        context_is_pad = []
+        for offset in self.frame_offsets:
+            raw_index = absolute_index + offset
+            clamped_index = max(episode_start, min(episode_end - 1, raw_index))
+            context_absolute_indices.append(clamped_index)
+            context_frame_indices.append(clamped_index - episode_start)
+            context_is_pad.append(raw_index < episode_start or raw_index >= episode_end)
+        return context_absolute_indices, context_frame_indices, context_is_pad
+
+    def _make_entries(self):
+        entries = []
+        for episode_index in sorted(self.episodes):
+            episode = self.dataset.meta.episodes[int(episode_index)]
+            episode_start = int(episode["dataset_from_index"])
+            episode_end = int(episode["dataset_to_index"])
+            for absolute_index in range(episode_start, episode_end):
+                dataset_index = self._to_dataset_index(absolute_index)
+                if dataset_index is None:
+                    continue
+                (
+                    context_absolute_indices,
+                    context_frame_indices,
+                    context_is_pad,
+                ) = self._make_context(absolute_index, episode_start, episode_end)
+                entries.append(
+                    {
+                        "dataset_index": int(dataset_index),
+                        "episode_index": int(episode_index),
+                        "frame_index": int(absolute_index - episode_start),
+                        "absolute_index": int(absolute_index),
+                        "context_absolute_indices": context_absolute_indices,
+                        "context_frame_indices": context_frame_indices,
+                        "context_is_pad": context_is_pad,
+                    }
+                )
+
+        if not entries:
+            raise ValueError("No LeRobot frames are available for slot feature caching.")
+        return entries
+
+    @staticmethod
+    def _scalar_tensor(value, dtype):
+        if torch.is_tensor(value):
+            value = value.reshape(-1)[0]
+            return value.to(dtype=dtype)
+        return torch.tensor(value, dtype=dtype)
+
+    def __getitem__(self, idx):
+        entry = self.entries[idx]
+        item = self.dataset[entry["dataset_index"]]
+        video = item[self.camera_key]
+        if video.ndim == 3:
+            video = video.unsqueeze(0)
+
+        timestamp = self._scalar_tensor(
+            item.get("timestamp", float(entry["frame_index"])), torch.float64
+        )
+        task_index = self._scalar_tensor(item.get("task_index", -1), torch.long)
+
+        return {
+            "video": video,
+            "cache_row": torch.tensor(self.row_offset + idx, dtype=torch.long),
+            "dataset_index": torch.tensor(self.dataset_index, dtype=torch.long),
+            "split_index": torch.tensor(self.split_index, dtype=torch.long),
+            "episode_index": torch.tensor(entry["episode_index"], dtype=torch.long),
+            "frame_index": torch.tensor(entry["frame_index"], dtype=torch.long),
+            "absolute_index": torch.tensor(entry["absolute_index"], dtype=torch.long),
+            "timestamp": timestamp,
+            "task_index": task_index,
+            "context_absolute_indices": torch.tensor(
+                entry["context_absolute_indices"], dtype=torch.long
+            ),
+            "context_frame_indices": torch.tensor(entry["context_frame_indices"], dtype=torch.long),
+            "context_is_pad": torch.tensor(entry["context_is_pad"], dtype=torch.bool),
+        }
+
+
 class LeRobotDataModule(pl.LightningDataModule):
     """LightningDataModule for LeRobot datasets used as VideoSAUR video inputs."""
 
@@ -724,6 +1249,7 @@ class LeRobotDataModule(pl.LightningDataModule):
         image_size: Union[int, Tuple[int, int], List[int]] = 224,
         video_backend: Optional[str] = "pyav",
         tolerance_s: float = 1e-3,
+        lerobot_format: str = "auto",
         val_fraction: float = 0.0,
         test_fraction: float = 0.0,
         train_episodes: Optional[List[int]] = None,
@@ -755,6 +1281,7 @@ class LeRobotDataModule(pl.LightningDataModule):
         self.image_size = image_size
         self.video_backend = video_backend
         self.tolerance_s = tolerance_s
+        self.lerobot_format = _normalize_lerobot_format(lerobot_format)
         self.val_fraction = float(val_fraction)
         self.test_fraction = float(test_fraction)
         self.train_episodes = _to_optional_list(train_episodes)
@@ -777,6 +1304,8 @@ class LeRobotDataModule(pl.LightningDataModule):
         self._test_episodes = None
         self._selected_episodes = None
         self._lerobot_dataset = None
+        self._resolved_lerobot_format = None
+        self.dataset_info = []
 
         if not 0.0 <= self.val_fraction < 1.0:
             raise ValueError("`val_fraction` must be in [0.0, 1.0).")
@@ -804,6 +1333,7 @@ class LeRobotDataModule(pl.LightningDataModule):
                 "LeRobotDataModule",
                 f"  - Repo id: {self.repo_id}",
                 f"  - Root: {self.root}",
+                f"  - LeRobot format: {self._get_lerobot_format()}",
                 f"  - Camera key: {camera_key}",
                 f"  - Train batch size: {self.batch_size}",
                 f"  - Eval batch size: {self.val_batch_size}",
@@ -817,7 +1347,21 @@ class LeRobotDataModule(pl.LightningDataModule):
             ]
         )
 
+    def _get_lerobot_format(self) -> str:
+        if self._resolved_lerobot_format is None:
+            self._resolved_lerobot_format = _resolve_lerobot_format(
+                self.lerobot_format,
+                self.root,
+                force_cache_sync=self.force_cache_sync,
+            )
+        return self._resolved_lerobot_format
+
     def _get_metadata(self):
+        if self._get_lerobot_format() == "v2":
+            if self.root is None:
+                raise ValueError("LeRobot v2 datasets require a local `root`.")
+            return LeRobotV2Metadata(repo_id=self.repo_id, root=self.root)
+
         metadata = _try_load_lerobot_info_metadata(self.root, self.force_cache_sync)
         if metadata is not None:
             return metadata
@@ -987,6 +1531,18 @@ class LeRobotDataModule(pl.LightningDataModule):
         if self._lerobot_dataset is not None:
             return self._lerobot_dataset
 
+        if self._get_lerobot_format() == "v2":
+            self._lerobot_dataset = LeRobotV2Dataset(
+                repo_id=self.repo_id,
+                root=self.root,
+                episodes=episodes,
+                image_transforms=LeRobotImageTransform(size=self.image_size),
+                delta_timestamps=self._get_delta_timestamps(),
+                tolerance_s=self.tolerance_s,
+                video_backend=self.video_backend,
+            )
+            return self._lerobot_dataset
+
         try:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
         except ImportError as exc:
@@ -1038,6 +1594,18 @@ class LeRobotDataModule(pl.LightningDataModule):
         )
 
         lerobot_dataset = self._get_lerobot_dataset(self._selected_episodes)
+        self.dataset_info = [
+            {
+                "repo_id": self.repo_id,
+                "root": self.root,
+                "camera_key": self.camera_key,
+                "lerobot_format": self._get_lerobot_format(),
+                "fps": self.fps,
+                "train_episodes": train_episodes,
+                "val_episodes": val_episodes,
+                "test_episodes": test_episodes,
+            }
+        ]
 
         if stage in (None, "fit") and self.train_set is None:
             self.train_set = LeRobotVideoDataset(
@@ -1064,17 +1632,28 @@ class LeRobotDataModule(pl.LightningDataModule):
             )
 
     def _get_dataloader(
-        self, dataset, batch_size: int, num_workers: int, shuffle: bool, drop_last: bool
+        self,
+        dataset,
+        batch_size: int,
+        num_workers: int,
+        shuffle: bool,
+        drop_last: bool,
+        sampler=None,
     ):
         dataloader_kwargs = {
             "dataset": dataset,
             "batch_size": batch_size,
-            "shuffle": shuffle,
             "num_workers": num_workers,
             "drop_last": drop_last,
             "worker_init_fn": worker_init_function,
             "pin_memory": self.pin_memory,
         }
+        if sampler is None:
+            dataloader_kwargs["shuffle"] = shuffle
+        else:
+            if shuffle:
+                raise ValueError("A DataLoader cannot use both `sampler` and `shuffle=True`.")
+            dataloader_kwargs["sampler"] = sampler
 
         if num_workers > 0:
             dataloader_kwargs["persistent_workers"] = (
@@ -1083,6 +1662,97 @@ class LeRobotDataModule(pl.LightningDataModule):
             dataloader_kwargs["prefetch_factor"] = 2
 
         return torch.utils.data.DataLoader(**dataloader_kwargs)
+
+    def _get_cache_dataset(
+        self,
+        lerobot_dataset,
+        split_index: int,
+        episodes: Optional[List[int]],
+        row_offset: int,
+    ):
+        if episodes is None:
+            return None
+        return LeRobotSlotCacheDataset(
+            lerobot_dataset,
+            camera_key=self.camera_key,
+            frame_offsets=self._get_frame_offsets(),
+            episodes=episodes,
+            dataset_index=0,
+            split_index=split_index,
+            row_offset=row_offset,
+        )
+
+    def cache_datasets(self, splits: Optional[List[str]] = None):
+        if splits is None:
+            splits = ["train", "val", "test"]
+        self.setup("predict")
+        split_episodes = {
+            "train": self._train_episodes,
+            "val": self._val_episodes,
+            "test": self._test_episodes,
+        }
+        lerobot_dataset = self._get_lerobot_dataset(self._selected_episodes)
+
+        datasets = []
+        row_offset = 0
+        for split_index, split_name in enumerate(splits):
+            if split_name not in split_episodes:
+                raise ValueError(f"Unknown LeRobot split `{split_name}`.")
+            dataset = self._get_cache_dataset(
+                lerobot_dataset,
+                split_index=split_index,
+                episodes=split_episodes[split_name],
+                row_offset=row_offset,
+            )
+            if dataset is None:
+                continue
+            datasets.append(dataset)
+            row_offset += len(dataset)
+        if not datasets:
+            raise ValueError("No LeRobot cache datasets were built for the requested splits.")
+        return datasets
+
+    def cache_dataloaders(
+        self,
+        splits: Optional[List[str]] = None,
+        *,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        requested_splits = ["train", "val", "test"] if splits is None else list(splits)
+        datasets = self.cache_datasets(splits)
+        loaders = []
+        for dataset in datasets:
+            split_name = requested_splits[dataset.split_index]
+            if split_name == "train":
+                batch_size = self.batch_size
+                num_workers = self.num_train_workers
+            elif split_name == "val":
+                batch_size = self.val_batch_size
+                num_workers = self.num_val_workers
+            else:
+                batch_size = self.test_batch_size
+                num_workers = self.num_test_workers
+            sampler = (
+                SequentialShardSampler(dataset, rank=rank, world_size=world_size)
+                if distributed and world_size > 1
+                else None
+            )
+            loaders.append(
+                self._get_dataloader(
+                    dataset,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    shuffle=False,
+                    drop_last=False,
+                    sampler=sampler,
+                )
+            )
+        return loaders
+
+    def predict_dataloader(self):
+        return self.cache_dataloaders()
 
     def train_dataloader(self):
         if self.train_set is None:
@@ -1142,6 +1812,7 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
         image_size: Union[int, Tuple[int, int], List[int]] = 224,
         video_backend: Optional[str] = "pyav",
         tolerance_s: float = 1e-3,
+        lerobot_format: str = "auto",
         val_fraction: float = 0.0,
         test_fraction: float = 0.0,
         train_episodes: Optional[List[int]] = None,
@@ -1160,6 +1831,7 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
             raise ValueError("`datasets` must contain at least one LeRobot dataset config.")
 
         self.root = LeRobotDataModule._resolve_root(root, data_dir)
+        self.lerobot_format = _normalize_lerobot_format(lerobot_format)
         self.dataset_configs = [
             self._normalize_dataset_config(dataset_config, data_dir)
             for dataset_config in datasets
@@ -1193,6 +1865,7 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
         self.val_set = None
         self.test_set = None
         self.dataset_info = []
+        self._cache_dataset_entries = []
         self._is_setup = False
 
         self._validate_split_fractions(self.val_fraction, self.test_fraction)
@@ -1220,6 +1893,9 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
         )
         if dataset_config["root"] is None and self.root is not None:
             dataset_config["root"] = os.path.join(self.root, dataset_config["repo_id"])
+        dataset_config["lerobot_format"] = _normalize_lerobot_format(
+            dataset_config.get("lerobot_format", self.lerobot_format)
+        )
         return dataset_config
 
     @staticmethod
@@ -1253,7 +1929,9 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
             camera_key = dataset_config.get("camera_key", "auto")
             lines.append(
                 f"  - Dataset {idx}: repo_id={dataset_config['repo_id']}, "
-                f"root={dataset_config.get('root')}, camera_key={camera_key}"
+                f"root={dataset_config.get('root')}, "
+                f"format={dataset_config.get('_resolved_lerobot_format', dataset_config['lerobot_format'])}, "
+                f"camera_key={camera_key}"
             )
         return "\n".join(lines)
 
@@ -1271,7 +1949,27 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
             raise ValueError(f"Invalid LeRobot fps for `{camera_key}`: {fps}")
         return {camera_key: [offset / fps for offset in self._get_frame_offsets()]}
 
+    def _get_lerobot_format(self, dataset_config: Dict[str, Any]) -> str:
+        resolved_format = dataset_config.get("_resolved_lerobot_format")
+        if resolved_format is None:
+            resolved_format = _resolve_lerobot_format(
+                dataset_config.get("lerobot_format", self.lerobot_format),
+                dataset_config.get("root"),
+                force_cache_sync=dataset_config.get("force_cache_sync", self.force_cache_sync),
+            )
+            dataset_config["_resolved_lerobot_format"] = resolved_format
+        return resolved_format
+
     def _get_metadata(self, dataset_config: Dict[str, Any]):
+        dataset_format = self._get_lerobot_format(dataset_config)
+        if dataset_format == "v2":
+            root = dataset_config.get("root")
+            if root is None:
+                raise ValueError(
+                    f"LeRobot v2 dataset `{dataset_config['repo_id']}` requires a local `root`."
+                )
+            return LeRobotV2Metadata(repo_id=dataset_config["repo_id"], root=root)
+
         metadata = _try_load_lerobot_info_metadata(
             dataset_config.get("root"),
             dataset_config.get("force_cache_sync", self.force_cache_sync),
@@ -1300,6 +1998,17 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
         delta_timestamps: Dict[str, List[float]],
         episodes: Optional[List[int]],
     ):
+        if self._get_lerobot_format(dataset_config) == "v2":
+            return LeRobotV2Dataset(
+                repo_id=dataset_config["repo_id"],
+                root=dataset_config.get("root"),
+                episodes=episodes,
+                image_transforms=LeRobotImageTransform(size=self.image_size),
+                delta_timestamps=delta_timestamps,
+                tolerance_s=dataset_config.get("tolerance_s", self.tolerance_s),
+                video_backend=dataset_config.get("video_backend", self.video_backend),
+            )
+
         try:
             from lerobot.datasets.lerobot_dataset import LeRobotDataset
         except ImportError as exc:
@@ -1458,9 +2167,12 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
         if self._is_setup:
             return
 
+        build_standard_sets = stage != "predict"
         train_sets = []
         val_sets = []
         test_sets = []
+        self.dataset_info = []
+        self._cache_dataset_entries = []
         for dataset_index, dataset_config in enumerate(self.dataset_configs):
             metadata = self._get_metadata(dataset_config)
             fps = metadata.fps
@@ -1486,37 +2198,50 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
                     "repo_id": dataset_config["repo_id"],
                     "root": dataset_config.get("root"),
                     "camera_key": camera_key,
+                    "lerobot_format": self._get_lerobot_format(dataset_config),
                     "fps": fps,
                     "train_episodes": train_episodes,
                     "val_episodes": val_episodes,
                     "test_episodes": test_episodes,
                 }
             )
-
-            train_sets.append(
-                self._make_video_dataset(
-                    lerobot_dataset, camera_key, train_episodes, dataset_index
-                )
+            self._cache_dataset_entries.append(
+                {
+                    "dataset": lerobot_dataset,
+                    "camera_key": camera_key,
+                    "dataset_index": dataset_index,
+                    "train_episodes": train_episodes,
+                    "val_episodes": val_episodes,
+                    "test_episodes": test_episodes,
+                }
             )
-            if val_episodes is not None:
-                val_sets.append(
-                    self._make_video_dataset(
-                        lerobot_dataset, camera_key, val_episodes, dataset_index
-                    )
-                )
-            if test_episodes is not None:
-                test_sets.append(
-                    self._make_video_dataset(
-                        lerobot_dataset, camera_key, test_episodes, dataset_index
-                    )
-                )
 
-        self.train_set = self._concat_or_none(train_sets)
-        self.val_set = self._concat_or_none(val_sets)
-        self.test_set = self._concat_or_none(test_sets)
-        if self.train_set is None:
-            raise ValueError("Mixed LeRobot training split is empty.")
-        self._is_setup = True
+            if build_standard_sets:
+                train_sets.append(
+                    self._make_video_dataset(
+                        lerobot_dataset, camera_key, train_episodes, dataset_index
+                    )
+                )
+                if val_episodes is not None:
+                    val_sets.append(
+                        self._make_video_dataset(
+                            lerobot_dataset, camera_key, val_episodes, dataset_index
+                        )
+                    )
+                if test_episodes is not None:
+                    test_sets.append(
+                        self._make_video_dataset(
+                            lerobot_dataset, camera_key, test_episodes, dataset_index
+                        )
+                    )
+
+        if build_standard_sets:
+            self.train_set = self._concat_or_none(train_sets)
+            self.val_set = self._concat_or_none(val_sets)
+            self.test_set = self._concat_or_none(test_sets)
+            if self.train_set is None:
+                raise ValueError("Mixed LeRobot training split is empty.")
+            self._is_setup = True
 
     def _get_train_sampler(self):
         if self.sampling.get("mode", "natural") == "natural":
@@ -1577,6 +2302,90 @@ class MixedLeRobotDataModule(pl.LightningDataModule):
             dataloader_kwargs["prefetch_factor"] = 2
 
         return torch.utils.data.DataLoader(**dataloader_kwargs)
+
+    def cache_datasets(self, splits: Optional[List[str]] = None):
+        if splits is None:
+            splits = ["train", "val", "test"]
+        self.setup("predict")
+
+        datasets = []
+        row_offset = 0
+        for split_index, split_name in enumerate(splits):
+            if split_name not in ("train", "val", "test"):
+                raise ValueError(f"Unknown LeRobot split `{split_name}`.")
+
+            split_datasets = []
+            for entry in self._cache_dataset_entries:
+                episodes = entry[f"{split_name}_episodes"]
+                if episodes is None:
+                    continue
+                dataset = LeRobotSlotCacheDataset(
+                    entry["dataset"],
+                    camera_key=entry["camera_key"],
+                    frame_offsets=self._get_frame_offsets(),
+                    episodes=episodes,
+                    dataset_index=entry["dataset_index"],
+                    split_index=split_index,
+                    row_offset=row_offset,
+                )
+                row_offset += len(dataset)
+                split_datasets.append(dataset)
+
+            split_dataset = self._concat_or_none(split_datasets)
+            if split_dataset is not None:
+                datasets.append(split_dataset)
+
+        if not datasets:
+            raise ValueError("No mixed LeRobot cache datasets were built for the requested splits.")
+        return datasets
+
+    @staticmethod
+    def _cache_split_index(dataset) -> int:
+        if isinstance(dataset, torch.utils.data.ConcatDataset):
+            return dataset.datasets[0].split_index
+        return dataset.split_index
+
+    def cache_dataloaders(
+        self,
+        splits: Optional[List[str]] = None,
+        *,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
+        requested_splits = ["train", "val", "test"] if splits is None else list(splits)
+        datasets = self.cache_datasets(splits)
+        loaders = []
+        for dataset in datasets:
+            split_name = requested_splits[self._cache_split_index(dataset)]
+            if split_name == "train":
+                batch_size = self.batch_size
+                num_workers = self.num_train_workers
+            elif split_name == "val":
+                batch_size = self.val_batch_size
+                num_workers = self.num_val_workers
+            else:
+                batch_size = self.test_batch_size
+                num_workers = self.num_test_workers
+            sampler = (
+                SequentialShardSampler(dataset, rank=rank, world_size=world_size)
+                if distributed and world_size > 1
+                else None
+            )
+            loaders.append(
+                self._get_dataloader(
+                    dataset,
+                    batch_size=batch_size,
+                    num_workers=num_workers,
+                    shuffle=False,
+                    drop_last=False,
+                    sampler=sampler,
+                )
+            )
+        return loaders
+
+    def predict_dataloader(self):
+        return self.cache_dataloaders()
 
     def train_dataloader(self):
         if self.train_set is None:

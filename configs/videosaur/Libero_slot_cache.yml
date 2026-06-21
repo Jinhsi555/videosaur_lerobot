@@ -124,14 +124,20 @@ val_metrics: null
 dataset:
   name: MixedLeRobotDataModule
   datasets:
-    # - repo_id: ego_exo4d
-    #   root: /mnt/oss_data/lerobotv3_processed/ego_exo4d
-    #   camera_key: observation.images.top_head
-    # - repo_id: something_something_v2
-    #   root: /mnt/oss_data/lerobotv3_processed/something_something_v2
-    #   camera_key: observation.images.egocentric
-    - repo_id: Libero
+    - repo_id: Libero-10
       root: /mnt/data/licy/FastWAM-AuxSignals/data/libero_mujoco3.3.2/libero_10_no_noops_lerobot
+      lerobot_format: v2
+      camera_key: observation.images.image
+    - repo_id: Libero-spatial
+      root: /mnt/data/licy/FastWAM-AuxSignals/data/libero_mujoco3.3.2/libero_spatial_no_noops_lerobot
+      lerobot_format: v2
+      camera_key: observation.images.image
+    - repo_id: Libero-goal
+      root: /mnt/data/licy/FastWAM-AuxSignals/data/libero_mujoco3.3.2/libero_goal_no_noops_lerobot
+      lerobot_format: v2
+      camera_key: observation.images.image
+    - repo_id: Libero-object
+      root: /mnt/data/licy/FastWAM-AuxSignals/data/libero_mujoco3.3.2/libero_object_no_noops_lerobot
       lerobot_format: v2
       camera_key: observation.images.image
 
@@ -154,8 +160,6 @@ dataset:
   return_dataset_index: true
 
   # Keep debug startup bounded: these ids are applied to each child dataset.
-  train_episodes: [0, 1, 2, 3, 4, 5, 6, 7]
-  val_episodes: [8, 9]
   test_episodes: null
   val_fraction: 0.0
   test_fraction: 0.0
