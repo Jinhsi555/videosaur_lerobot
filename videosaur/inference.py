@@ -10,7 +10,12 @@ import os
 import numpy as np
 import imageio
 from torchvision import transforms as tvt
-from videosaur.visualizations import mix_inputs_with_masks, draw_segmentation_masks_on_image, color_map
+from videosaur.visualizations import (
+    mix_inputs_with_masks,
+    mix_inputs_with_masks_and_slot_overlay,
+    draw_segmentation_masks_on_image,
+    color_map,
+)
 import matplotlib.pyplot as plt
 
 
@@ -169,7 +174,19 @@ def main(config):
         os.makedirs(save_dir, exist_ok=True)
         inputs_cpu = _move_to_device(inputs, torch.device("cpu"))
         outputs_cpu = _move_to_device(outputs, torch.device("cpu"))
-        masked_video_frames = mix_inputs_with_masks(inputs_cpu, outputs_cpu)
+        aux_outputs_cpu = _move_to_device(aux_outputs, torch.device("cpu"))
+        layout = str(config.output.get("layout", "mask_grid"))
+        if layout == "mask_grid":
+            masked_video_frames = mix_inputs_with_masks(inputs_cpu, outputs_cpu)
+        elif layout == "mask_grid_with_slot_overlay":
+            masked_video_frames = mix_inputs_with_masks_and_slot_overlay(
+                inputs_cpu,
+                outputs_cpu,
+                aux_outputs_cpu,
+                alpha=float(config.output.get("slot_overlay_alpha", 0.75)),
+            )
+        else:
+            raise ValueError(f"Unknown video output layout: {layout}")
         with imageio.get_writer(config.output.save_path, fps=config.fps) as writer:
             for frame in masked_video_frames:
                 writer.append_data(frame)

@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import ImageColor, Image
 from videosaur.data.transforms import Resize
 
@@ -307,6 +308,115 @@ def create_grid_frame_rgb(frames, grid_size=(2, 6), image_size=(224, 224), paddi
         grid_frame[start_row:end_row, start_col:end_col, :] = frame
     
     return grid_frame
+
+
+def _video_visualization_to_uint8(video: torch.Tensor, frame_idx: int) -> torch.Tensor:
+    frame = video[0, :, frame_idx].detach().cpu()
+    if torch.is_floating_point(frame):
+        if frame.max() <= 1.0:
+            frame = frame * 255
+        frame = frame.clamp(0, 255)
+    return frame.to(torch.uint8)
+
+
+def _resize_rgb_frame(frame: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    if frame.shape[:2] == size:
+        return frame
+
+    frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).float().unsqueeze(0)
+    frame_tensor = F.interpolate(frame_tensor, size=size, mode="bilinear", align_corners=False)
+    return frame_tensor[0].clamp(0, 255).to(torch.uint8).permute(1, 2, 0).numpy()
+
+
+def _resize_video_masks(masks: torch.Tensor, size: Tuple[int, int], mode: str) -> torch.Tensor:
+    b, f, n_slots, h, w = masks.shape
+    masks = masks.reshape(b * f, n_slots, h, w).float()
+    if mode == "nearest":
+        masks = F.interpolate(masks, size=size, mode=mode)
+    else:
+        masks = F.interpolate(masks, size=size, mode=mode, align_corners=False)
+    return masks.reshape(b, f, n_slots, size[0], size[1])
+
+
+def _hard_decoder_masks_for_video_overlay(inputs, outputs, aux_outputs=None) -> torch.Tensor:
+    video = inputs["video_visualization"]
+    if video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3:
+        raise ValueError(
+            "Expected inputs['video_visualization'] with shape [1, 3, frames, height, width]"
+        )
+
+    _, _, n_frames, height, width = video.shape
+    masks = None
+    if aux_outputs is not None:
+        masks = aux_outputs.get("decoder_masks_vis_hard", aux_outputs.get("decoder_masks_hard"))
+
+    if masks is not None:
+        if masks.ndim != 5:
+            raise ValueError(
+                f"Expected hard masks with shape [B, T, slots, H, W], got {masks.shape}"
+            )
+        if masks.shape[0] != 1 or masks.shape[1] != n_frames:
+            raise ValueError(
+                "Hard mask batch/frame dimensions do not match inputs['video_visualization']"
+            )
+        if masks.shape[-2:] != (height, width):
+            masks = _resize_video_masks(masks, (height, width), mode="nearest")
+        return masks[0].bool()
+
+    masks = outputs["decoder"]["masks"]
+    if masks.ndim != 4:
+        raise ValueError(f"Expected decoder masks with shape [B, T, slots, H*W], got {masks.shape}")
+
+    b, f, n_slots, hw = masks.shape
+    h = int(np.sqrt(hw))
+    w = h
+    if h * w != hw:
+        raise ValueError(f"Expected square decoder masks, got flattened size {hw}")
+    if b != 1 or f != n_frames:
+        raise ValueError("Decoder mask batch/frame dimensions do not match video visualization")
+
+    masks = masks.reshape(b, f, n_slots, h, w)
+    if masks.shape[-2:] != (height, width):
+        masks = _resize_video_masks(masks, (height, width), mode="bilinear")
+
+    ind = torch.argmax(masks, dim=2, keepdim=True)
+    hard_masks = torch.zeros_like(masks).scatter_(2, ind, 1).bool()
+    return hard_masks[0]
+
+
+def mix_inputs_with_masks_and_slot_overlay(
+    inputs,
+    outputs,
+    aux_outputs=None,
+    alpha: float = 0.75,
+    softmasks: bool = True,
+    padding: int = 2,
+):
+    grid_frames = mix_inputs_with_masks(inputs, outputs, softmasks=softmasks)
+    masks_video = _hard_decoder_masks_for_video_overlay(inputs, outputs, aux_outputs)
+    video = inputs["video_visualization"]
+    cmap = color_map(masks_video.shape[1])
+
+    mixed_video_frames = []
+    for t, grid_frame in enumerate(grid_frames):
+        image = _video_visualization_to_uint8(video, t)
+        slot_overlay = draw_segmentation_masks_on_image(
+            image, masks_video[t], colors=cmap, alpha=alpha
+        )
+        slot_overlay = slot_overlay.permute(1, 2, 0).numpy()
+
+        target_height = grid_frame.shape[0]
+        source_height, source_width = slot_overlay.shape[:2]
+        target_width = max(1, int(round(source_width * target_height / source_height)))
+        slot_overlay = _resize_rgb_frame(slot_overlay, (target_height, target_width))
+
+        spacer = np.zeros((target_height, padding, 3), dtype=np.uint8)
+        mixed_video_frames.append(
+            np.concatenate([grid_frame, spacer, slot_overlay], axis=1).astype(np.uint8)
+        )
+
+    return mixed_video_frames
+
 
 def mix_inputs_with_masks(inputs, outputs, softmasks=True):
         
