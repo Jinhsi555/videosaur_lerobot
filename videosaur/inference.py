@@ -6,6 +6,7 @@ from omegaconf import OmegaConf
 from videosaur import configuration, models
 from videosaur.data.transforms import CropResize, Normalize, Resize, build_inference_transform
 from videosaur.data.datamodules import LeRobotImageTransform
+from videosaur.interactive_export import export_interactive_viewer, interactive_enabled
 import os
 import numpy as np
 import imageio
@@ -17,6 +18,13 @@ from videosaur.visualizations import (
     color_map,
 )
 import matplotlib.pyplot as plt
+
+
+def load_inference_config(config_path: str, overrides=None):
+    config = OmegaConf.load(config_path)
+    if overrides:
+        config = OmegaConf.merge(config, OmegaConf.from_dotlist(overrides))
+    return config
 
 
 def load_model_from_checkpoint(checkpoint_path: str, config_path: str):
@@ -153,7 +161,7 @@ def main(config):
     
     device = _resolve_device(config)
     print(f"Inference device: {device}")
-    model, _ = load_model_from_checkpoint(config.checkpoint, config.model_config)
+    model, model_config = load_model_from_checkpoint(config.checkpoint, config.model_config)
     model.initializer.n_slots = config.n_slots
     model = model.to(device)
     # Prepare the video dict
@@ -168,13 +176,20 @@ def main(config):
     with torch.inference_mode():
         outputs = model(inputs)
         aux_outputs = model.aux_forward(inputs, outputs)
+    inputs_cpu = None
+    outputs_cpu = None
+    aux_outputs_cpu = None
+    if config.input.type == "video" and (
+        config.output.get("save_path") or interactive_enabled(config)
+    ):
+        inputs_cpu = _move_to_device(inputs, torch.device("cpu"))
+        outputs_cpu = _move_to_device(outputs, torch.device("cpu"))
+        aux_outputs_cpu = _move_to_device(aux_outputs, torch.device("cpu"))
+
     if config.input.type=="video" and config.output.save_path:
         # Save the results
         save_dir = os.path.dirname(config.output.save_path)
         os.makedirs(save_dir, exist_ok=True)
-        inputs_cpu = _move_to_device(inputs, torch.device("cpu"))
-        outputs_cpu = _move_to_device(outputs, torch.device("cpu"))
-        aux_outputs_cpu = _move_to_device(aux_outputs, torch.device("cpu"))
         layout = str(config.output.get("layout", "mask_grid"))
         if layout == "mask_grid":
             masked_video_frames = mix_inputs_with_masks(inputs_cpu, outputs_cpu)
@@ -191,6 +206,15 @@ def main(config):
             for frame in masked_video_frames:
                 writer.append_data(frame)
         writer.close()
+    if config.input.type == "video" and interactive_enabled(config):
+        viewer_dir = export_interactive_viewer(
+            config,
+            model_config,
+            inputs_cpu,
+            outputs_cpu,
+            aux_outputs_cpu,
+        )
+        print(f"Interactive viewer: {viewer_dir}")
     elif config.input.type=="image" and config.output.save_path:
         save_dir = os.path.dirname(config.output.save_path)
         os.makedirs(save_dir, exist_ok=True)
@@ -205,8 +229,13 @@ def main(config):
     print("Inference completed.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Perform inference on a single MP4 video.")
-    parser.add_argument("--config", default="configs/inference/movi_c.yml", help="Configuration to run")
+    parser = argparse.ArgumentParser(description="Perform inference on a video or image.")
+    parser.add_argument(
+        "--config",
+        default="configs/inference/movi_c.yml",
+        help="Configuration to run",
+    )
+    parser.add_argument("config_overrides", nargs="*", help="OmegaConf dotlist overrides")
     args = parser.parse_args()
-    config = OmegaConf.load(args.config)
+    config = load_inference_config(args.config, args.config_overrides)
     main(config)

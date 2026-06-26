@@ -1,11 +1,11 @@
-# checkpoint: logs/videosaur/2026-06-11-15-51-53_lerobot_something_something_v2_2/checkpoints/step=100000-v1.ckpt
-checkpoint: logs/videosaur/2026-06-16-16-48-05_lerobot_mixed_3/checkpoints/step=50000.ckpt
+checkpoint: logs/videosaur/2026-06-11-15-51-53_lerobot_something_something_v2_2/checkpoints/step=100000-v1.ckpt
+# checkpoint: logs/videosaur/2026-06-16-16-48-05_lerobot_mixed_3/checkpoints/step=50000.ckpt
 model_config: configs/videosaur/lerobot_mixed_dataset.yml
 n_slots: 5
 fps: 30
 device: auto
 input:
-  path: inference_output/100kstep_ssv2/robo_cam.mp4
+  path: /mnt/workspace/wlb/videosaur_lerobot/data/libero/task00_episode_000000_open_middle_drawer.mp4
   type: video
   transforms:
     style: lerobot
@@ -13,6 +13,10 @@ input:
     dataset_type: video
     input_size: 224
 output:
-  save_path: inference_output/mix_dataset_50k/robo_cam-mask-5-slots-50000step.mp4
+  save_path: inference_output/mix_dataset_50k/task00_episode_000000_open_middle_drawer-mask-5-slots-50000step.mp4
   layout: mask_grid_with_slot_overlay
   slot_overlay_alpha: 0.75
+  interactive:
+    enabled: true
+    feature_key: encoder.vit_block_keys12
+    prediction_key: decoder.reconstruction
