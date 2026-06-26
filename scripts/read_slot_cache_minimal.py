@@ -5,7 +5,7 @@ import numpy as np
 import pyarrow.parquet as pq
 
 
-cache_dir = Path("libero_slot_cache")
+cache_dir = Path("libero_slot_cache/cache")
 
 index = pq.read_table(cache_dir / "index.parquet")
 with open(cache_dir / "metadata.json", "r", encoding="utf-8") as f:

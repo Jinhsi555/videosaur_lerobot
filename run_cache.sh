@@ -19,40 +19,28 @@ export NNODES="${NNODES:-1}"
 export NODE_RANK="${NODE_RANK:-${GROUP_RANK:-0}}"
 export NPROC_PER_NODE="${NPROC_PER_NODE:-${LOCAL_WORLD_SIZE:-1}}"
 export WORLD_SIZE="${WORLD_SIZE:-$((NNODES * NPROC_PER_NODE))}"
+export CACHE_SEED="${CACHE_SEED:-0}"
 
 mkdir -p "${HUGGINGFACE_HUB_CACHE}"
 mkdir -p "${TORCH_HOME}"
 
 echo "torch.distributed.run: nnodes=${NNODES} node_rank=${NODE_RANK} nproc_per_node=${NPROC_PER_NODE} master=${MASTER_ADDR}:${MASTER_PORT} world_size=${WORLD_SIZE}"
 
-# python -m torch.distributed.run \
-#   --nnodes="${NNODES}" \
-#   --node-rank="${NODE_RANK}" \
-#   --nproc-per-node="${NPROC_PER_NODE}" \
-#   --master-addr="${MASTER_ADDR}" \
-#   --master-port="${MASTER_PORT}" \
-#   -m videosaur.cache_lerobot_slots \
-#   --checkpoint logs/videosaur/2026-06-16-16-48-05_lerobot_mixed_3/checkpoints/step=50000.ckpt \
-#   --output-dir /mnt/workspace/wlb/videosaur_lerobot/libero_slot_cache \
-#   --splits train \
-#   --target-shard-mb 256 \
-#   configs/videosaur/Libero_slot_cache.yml \
-#   trainer.devices="${NPROC_PER_NODE}" \
-#   globals.BATCH_SIZE_PER_GPU=128 \
-#   globals.NUM_GPUS="${WORLD_SIZE}"
-
 python -m torch.distributed.run \
   --nnodes="${NNODES}" \
   --node-rank="${NODE_RANK}" \
-  --nproc-per-node="2" \
+  --nproc-per-node="${NPROC_PER_NODE}" \
   --master-addr="${MASTER_ADDR}" \
   --master-port="${MASTER_PORT}" \
   -m videosaur.cache_lerobot_slots \
   --checkpoint logs/videosaur/2026-06-16-16-48-05_lerobot_mixed_3/checkpoints/step=50000.ckpt \
-  --output-dir /mnt/workspace/wlb/videosaur_lerobot/libero_slot_cache \
+  --output-dir /mnt/oss_data/Libero_slot_cache/test \
+  --seed "${CACHE_SEED}" \
   --splits train \
+  --overwrite \
   --target-shard-mb 256 \
   configs/videosaur/Libero_slot_cache.yml \
-  trainer.devices="2" \
+  trainer.devices="${NPROC_PER_NODE}" \
   globals.BATCH_SIZE_PER_GPU=128 \
-  globals.NUM_GPUS="${WORLD_SIZE}"
+  globals.NUM_GPUS="${WORLD_SIZE}" \
+  # dataset.train_episodes=[0,1,2,3,4,5,6,7,8,9]
