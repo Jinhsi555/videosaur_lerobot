@@ -166,3 +166,8 @@ logs/
 logs_debug/
 lightning_logs/
 *.mp4
+
+libero_slot_cache
+slot_cache_debug
+data
+inference_output
