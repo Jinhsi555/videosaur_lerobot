@@ -6,6 +6,9 @@
 - config 里的字段如何对应到框架组件
 - 如何读取生成好的 slot feature cache
 
+如果要把混合多个 LeRobot 数据集的改动迁移到其他分支或仓库，先看
+`docs/lerobot_mixed_dataset_migration_zh.md`。
+
 ## Config 入口
 
 常用配置文件：
@@ -47,6 +50,113 @@
   dataset.test_episodes=null \
   dataset.batch_size=2
 ```
+
+## 推理交互可视化
+
+`inference.sh` 默认会在生成 mask MP4 的同时导出本地交互式 viewer。viewer 使用静态 atlas PNG，不依赖前端 hover 时请求 Python API，因此 patch heatmap 交互延迟低。
+
+基本用法：
+
+```bash
+./inference.sh <输入视频目录或单个mp4> <输出目录>
+```
+
+示例：
+
+```bash
+OVERWRITE=1 ./inference.sh \
+  data/libero \
+  inference_output/visualization
+```
+
+如果输入是目录，脚本只处理该目录第一层的 `*.mp4`。如果输入是单个视频，只会处理该视频。默认已有 mask MP4 时会跳过；需要重新生成新版 viewer 时加 `OVERWRITE=1`。
+
+每个视频会生成：
+
+```text
+<输出目录>/<video_stem>-mask-7-slots-50000step.mp4
+<输出目录>/<video_stem>-viewer/
+```
+
+viewer 目录中关键文件：
+
+- `index.html`：交互页面。
+- `manifest.json`：记录帧数、patch grid、slot 数、资源路径和 prediction 配置。
+- `frames/`：原始可视化帧。
+- `heatmaps/feature/`：raw feature affinity atlas。
+- `heatmaps/target/`：按 transition loss 的 `FeatureTimeSimilarity` 计算出的 target 分布 atlas。
+- `heatmaps/prediction/`：decoder prediction logits 经过 softmax 后的分布 atlas。
+- `heatmaps/difference/`：`Decoder Prediction - Feature Target` 的差值 atlas。
+- `heatmaps_fixed/`：fixed-scale 版本的 `target`、`prediction`、`difference` atlas，用于按同一概率/差值尺度比较颜色。
+- `masks_soft/`、`masks_hard/`：每个 slot 的 mask。
+- `slot_overlays/`：预生成的彩色 slot overlay，用于页面右侧快速显示。
+
+启动本地 viewer server：
+
+```bash
+.venv/bin/python -m videosaur.interactive_viewer \
+  inference_output/visualization \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+打开：
+
+```text
+http://127.0.0.1:8000/
+```
+
+也可以让 `inference.sh` 批量推理结束后自动启动：
+
+```bash
+SERVE_VIEWER=1 OVERWRITE=1 ./inference.sh \
+  data/libero \
+  inference_output/visualization
+```
+
+页面模式说明：
+
+- `Raw Affinity`：source frame 的某个 patch 与 target frame 所有 patch 的原始 feature 相似度。
+- `Feature Target`：训练 transition loss 使用的 target 分布，按 `FeatureTimeSimilarity` 的 `time_shift`、`normalize`、`threshold`、`temperature`、`softmax` 计算。
+- `Decoder Prediction`：`decoder.reconstruction[..., prediction_dims]` 的 softmax 分布。
+- `Difference`：`Decoder Prediction - Feature Target`。暖色表示 decoder 预测强于 target，冷色表示 decoder 预测弱于 target。
+- `Relative / Fixed`：`Relative` 对每个 source patch 独立做颜色拉伸，便于看热点位置；`Fixed` 使用固定概率尺度，便于直接比较 `Feature Target` 和 `Decoder Prediction` 的强弱。
+
+页面交互：
+
+- 移动鼠标到 source frame patch 上，会更新 target frame heatmap。
+- 点击 patch 可锁定该 patch；再次点击同一 patch 取消锁定。
+- 顶部可切换 heatmap 模式、播放/暂停和调整播放速度。
+- 右侧显示当前帧 slot overlay、透明度、slot 覆盖率。
+- 下方每个 slot mask tile 可点击高亮对应 slot。
+
+如果要调试精确数值，而不只是看 PNG atlas，可以打开 `debug_arrays`。这样 viewer 会额外写出 `arrays/features.npy` 和 `arrays/prediction_logits.npy`：
+
+```bash
+.venv/bin/python -m videosaur.inference \
+  --config configs/inference/movi_c.yml \
+  input.path=data/libero/task03_episode_000114_put_bowl_on_plate.mp4 \
+  output.save_path=/tmp/videosaur_debug/debug-mask.mp4 \
+  output.interactive.enabled=true \
+  output.interactive.viewer_dir=/tmp/videosaur_debug/debug-viewer \
+  output.interactive.debug_arrays=true
+```
+
+切换 checkpoint 时要同时切换匹配的 model config。例如 `lerobot_something_something_v2_2` 的 100k checkpoint：
+
+```bash
+.venv/bin/python -m videosaur.inference \
+  --config configs/inference/movi_c.yml \
+  checkpoint=logs/videosaur/2026-06-11-15-51-53_lerobot_something_something_v2_2/checkpoints/step=100000-v1.ckpt \
+  model_config=configs/videosaur/lerobot_something_something_v2.yml \
+  input.path=data/libero/task03_episode_000114_put_bowl_on_plate.mp4 \
+  output.save_path=/tmp/videosaur_ssv2_100k/debug-mask.mp4 \
+  output.interactive.enabled=true \
+  output.interactive.viewer_dir=/tmp/videosaur_ssv2_100k/debug-viewer \
+  output.interactive.debug_arrays=true
+```
+
+注意：修改 viewer 导出逻辑后，已有 `*-viewer/` 不会自动更新，需要重新跑 inference 才会生成新版 `manifest.json` 和 atlas。
 
 ## Config 结构
 
