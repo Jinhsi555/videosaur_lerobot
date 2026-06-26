@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
@@ -13,6 +15,7 @@ from videosaur.cache_lerobot_slots import (
     SlotCachePredictDataModule,
     SlotFeaturePredictor,
     SlotFeaturePredictionWriter,
+    _build_metadata,
     finalize_sharded_cache,
 )
 
@@ -160,6 +163,26 @@ def test_slot_cache_predict_datamodule_builds_sharded_loader_after_ddp_init(monk
             "world_size": 2,
         }
     ]
+
+
+def test_build_metadata_records_cache_seed():
+    args = SimpleNamespace(
+        config="configs/videosaur/Libero_slot_cache.yml",
+        checkpoint="checkpoint.ckpt",
+        dtype="float16",
+        target_shard_mb=256.0,
+        config_overrides=["dataset.train_episodes=[0]"],
+    )
+
+    metadata = _build_metadata(
+        args=args,
+        splits=["train"],
+        dataset_info=_dataset_info(),
+        expected_rows=3,
+        cache_seed=123,
+    )
+
+    assert metadata["cache_seed"] == 123
 
 
 def test_prediction_writer_writes_sharded_features_and_index_fragments(tmp_path):

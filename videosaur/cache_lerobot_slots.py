@@ -720,6 +720,7 @@ def _build_metadata(
     splits: List[str],
     dataset_info: List[Dict[str, Any]],
     expected_rows: int,
+    cache_seed: int,
 ) -> Dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -730,6 +731,7 @@ def _build_metadata(
         "checkpoint_path": os.fspath(pathlib.Path(args.checkpoint).resolve()),
         "git_commit": _git_commit(pathlib.Path.cwd()),
         "slot_source": "outputs.processor.state[:, -1]",
+        "cache_seed": int(cache_seed),
         "dtype": args.dtype,
         "frame_offsets": list(dataset_info[0].get("frame_offsets", []))
         if dataset_info
@@ -774,6 +776,9 @@ def run(args) -> int:
             additional_overrides=args.config_overrides,
         )
 
+    cache_seed = int(args.seed)
+    pl.seed_everything(cache_seed, workers=True)
+
     datamodule = data.build(config.dataset, data_dir=args.data_dir)
     splits = args.splits
     cache_datasets = datamodule.cache_datasets(splits)
@@ -817,6 +822,7 @@ def run(args) -> int:
             splits=splits,
             dataset_info=dataset_info,
             expected_rows=expected_rows,
+            cache_seed=cache_seed,
         )
         finalize_sharded_cache(
             output_dir,
@@ -841,6 +847,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", required=True, help="VideoSAUR checkpoint to load.")
     parser.add_argument("--output-dir", required=True, help="Directory for the slot feature cache.")
     parser.add_argument("--splits", type=_parse_splits, default=_parse_splits("train,val,test"))
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for reproducible slot initialization during cache generation.",
+    )
     parser.add_argument("--dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output dir.")
     parser.add_argument(
